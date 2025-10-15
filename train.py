@@ -46,8 +46,8 @@ def parse_arguments():
         '--database',
         type=str,
         default='WebFace',
-        choices=['WebFace', 'VggFace2', "MS1M"],
-        help='Database to use for training. Options: WebFace, VggFace2.'
+        choices=['WebFace', 'VggFace2', "MS1M", 'VggFaceHQ'],
+        help='Database to use for training. Options: WebFace, VggFace2, MS1M, VggFaceHQ.'
     )
 
     # Model Settings
@@ -130,7 +130,7 @@ def parse_arguments():
     return parser.parse_args()
 
 def validate_model(model, classification_head, val_loader, device):
-    """Valida o modelo no subset de validação do VGGFace2"""
+    """Validates the model on validation subset"""
     model.eval()
     classification_head.eval()
     
@@ -154,7 +154,7 @@ def validate_model(model, classification_head, val_loader, device):
     
     accuracy = total_correct / total_samples
     
-    # Voltar para modo de treino
+    # Return to training mode
     model.train()
     classification_head.train()
     
@@ -214,11 +214,11 @@ def train_one_epoch(
         # calculate_accuracy is a function to compute classification accuracy.
         accuracy = calculate_accuracy(output, target)
 
-        if params.distributed:
+        if args.distributed:
             # reduce_tensor is used in distributed training to aggregate metrics (e.g., loss, accuracy)
             # across multiple GPUs. It ensures all devices contribute to the final metric computation.
-            reduced_loss = reduce_tensor(loss, params.world_size)
-            accuracy = reduce_tensor(accuracy, params.world_size)
+            reduced_loss = reduce_tensor(loss, args.world_size)
+            accuracy = reduce_tensor(accuracy, args.world_size)
         else:
             reduced_loss = loss
 
@@ -283,6 +283,9 @@ def main(params):
         },
         'MS1M': {
             'num_classes': 85742,
+        },
+        'VggFaceHQ': {
+            'num_classes': 9131,
         }
     }
     if params.database not in db_config:
@@ -312,8 +315,8 @@ def main(params):
     model = model.to(device)
 
     model_without_ddp = model
-    if params.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[params.local_rank])
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
         model_without_ddp = model.module
 
     # Create save path if it does not exist
@@ -325,6 +328,7 @@ def main(params):
 
     # Transformations for images
     train_transform = transforms.Compose([
+        transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(
@@ -333,13 +337,14 @@ def main(params):
         )
     ])
 
-    # DataLoader com validation split
+    # DataLoader with validation split
     LOGGER.info('Loading training data.')
     full_dataset = ImageFolder(root=params.root, transform=train_transform)
 
     train_dataset, val_dataset = create_validation_split(full_dataset, val_split=0.1)
 
     val_transform = transforms.Compose([
+        transforms.Resize((112, 112)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
@@ -405,7 +410,7 @@ def main(params):
     # Training loop
     LOGGER.info(f'Training started for {params.network}, Classifier: {params.classifier}')
     for epoch in range(start_epoch, params.epochs):
-        if params.distributed:
+        if args.distributed:
             train_sampler.set_epoch(epoch)
         train_one_epoch(
             model,
@@ -435,11 +440,10 @@ def main(params):
         save_on_master(checkpoint, last_save_path)
 
         if params.local_rank == 0:
-            # Avaliação LFW (usar path configurável ou padrão)
-            lfw_path = getattr(params, 'lfw_root', 'data/val')
-            curr_accuracy, _ = evaluate.eval(model_without_ddp, device=device, lfw_root=lfw_path)
+            # LFW Evaluation (for best model and early stopping)
+            curr_accuracy, _ = evaluate.eval(model_without_ddp, device=device)
             
-            # Validação interna VGGFace2 (apenas para monitoramento)
+            # Internal validation (for monitoring only)
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=params.batch_size,
@@ -449,7 +453,7 @@ def main(params):
             )
             
             val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
-            LOGGER.info(f'Validation accuracy (VGGFace2 subset): {val_accuracy:.4f}')
+            LOGGER.info(f'Validation accuracy ({params.database} subset): {val_accuracy:.4f}')
 
         if early_stopping(epoch, curr_accuracy):
             break
