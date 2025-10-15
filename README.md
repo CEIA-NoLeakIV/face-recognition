@@ -184,7 +184,7 @@ As imagens são processadas da seguinte forma:
 - Normalização: mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)
 - Formato: RGB
 
-### Data Augmentation
+### Data
 
 Durante o treinamento:
 - Random horizontal flip
