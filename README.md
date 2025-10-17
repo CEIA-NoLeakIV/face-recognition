@@ -17,17 +17,26 @@ Este projeto implementa um pipeline completo para treinamento e avaliação de m
 
 - **MCP (Margin Cosine Product)**: Implementação do CosFace
 - **AL (Angle Linear)**: Implementação do SphereFace
-- **ARC**: Implementação do ArcFace
+- **ARC**: Implementação do ArcFace (*)
 - **L (Linear)**: Classificador linear padrão
 
 ## Datasets Suportados
 
-O framework suporta os seguintes datasets:
+### Datasets de Treinamento
+
+O framework suporta os seguintes datasets para treinamento:
 
 - **WebFace**: 10,572 identidades
 - **VggFace2**: 8,631 identidades
 - **MS1M**: 85,742 identidades
-- **VggFaceHQ**: 9,131 identidades
+- **VggFaceHQ**: 9,131 identidades (imagens de alta qualidade com tamanhos variados)
+
+### Datasets de Validação
+
+O framework suporta os seguintes datasets para validação:
+
+- **LFW (Labeled Faces in the Wild)**: Benchmark padrão para reconhecimento facial
+- **CelebA**: Dataset de celebridades com múltiplas imagens por identidade
 
 ## Estrutura do Projeto
 
@@ -39,7 +48,7 @@ O framework suporta os seguintes datasets:
 │   ├── general.py          # Funções auxiliares
 │   └── validation_split.py # Split de validação
 ├── train.py                # Script de treinamento
-├── evaluate.py             # Avaliação em LFW
+├── evaluate.py             # Avaliação em LFW/CelebA
 ├── inference.py            # Inferência e comparação
 └── requirements.txt        # Dependências do projeto
 ```
@@ -54,27 +63,7 @@ pip install -r requirements.txt
 
 ### Resolução de Problemas com CUDA
 
-Caso o PyTorch não reconheça a versão do CUDA instalada no sistema, instale manualmente uma versão compatível:
-
-**Para CUDA 11.8:**
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-```
-
-**Para CUDA 12.1:**
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-```
-
-**Para CPU apenas:**
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-```
-
-Verifique a versão do CUDA disponível com:
-```bash
-nvidia-smi
-```
+Caso o PyTorch não reconheça a versão do CUDA instalada no sistema, instale manualmente uma versão compatível
 
 ## Uso
 
@@ -88,6 +77,8 @@ python train.py \
     --database <nome_database> \
     --network <arquitetura> \
     --classifier <tipo_loss> \
+    --val-dataset <dataset_validacao> \
+    --val-root <caminho_validacao> \
     --batch-size <tamanho_batch> \
     --epochs <num_epocas> \
     --lr <taxa_aprendizado>
@@ -95,9 +86,13 @@ python train.py \
 
 #### Parâmetros Principais
 
-**Dataset:**
+**Dataset de Treinamento:**
 - `--root`: Caminho para o diretório das imagens de treinamento
 - `--database`: Nome do dataset (WebFace, VggFace2, MS1M, VggFaceHQ)
+
+**Dataset de Validação:**
+- `--val-dataset`: Dataset de validação (lfw, celeba) - Padrão: lfw
+- `--val-root`: Caminho para o diretório do dataset de validação - Padrão: data/lfw/val
 
 **Modelo:**
 - `--network`: Arquitetura da rede (sphere20, sphere36, sphere64, mobilenetv1, mobilenetv2, mobilenetv3_small, mobilenetv3_large)
@@ -119,20 +114,6 @@ python train.py \
 - `--num-workers`: Número de workers para DataLoader (padrão: 8)
 - `--print-freq`: Frequência de impressão de logs (padrão: 100)
 
-#### Exemplo de Treinamento
-
-```bash
-python train.py \
-    --root data/train/webface/ \
-    --database WebFace \
-    --network sphere20 \
-    --classifier MCP \
-    --batch-size 256 \
-    --epochs 30 \
-    --lr 0.1 \
-    --milestones 10 20 25
-```
-
 ### Retomar Treinamento
 
 Para continuar um treinamento anterior:
@@ -148,13 +129,21 @@ python train.py \
 
 ### Avaliação
 
-Avaliação em LFW (Labeled Faces in the Wild):
+Avaliação standalone em LFW ou CelebA:
 
+**Avaliar em LFW (padrão):**
 ```bash
 python evaluate.py
 ```
 
-O script avalia os modelos treinados e calcula a similaridade média entre pares de faces positivos no dataset LFW.
+**Avaliar em CelebA:**
+```bash
+# Edite evaluate.py e ajuste os parâmetros na chamada da função eval()
+# Exemplo:
+eval(model, model_path='weights/model.pth', val_dataset='celeba', val_root='data/celeba')
+```
+
+O script avalia os modelos treinados e calcula a similaridade média entre pares de faces positivos no dataset de validação.
 
 ### Inferência
 
@@ -180,17 +169,19 @@ Edite as variáveis no final do arquivo `inference.py` para configurar:
 ### Pré-processamento
 
 As imagens são processadas da seguinte forma:
-- Redimensionamento para 112x112 pixels
+- **Resize obrigatório para 112x112 pixels** (aplicado automaticamente)
 - Normalização: mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)
 - Formato: RGB
 
-### Data
+### Data Augmentation
 
-Durante o treinamento:
+**Durante o treinamento:**
+- Resize para 112x112 (obrigatório)
 - Random horizontal flip
-- Resize para 112x112
+- Normalização
 
-Na avaliação:
+**Na avaliação:**
+- Resize para 112x112 (obrigatório)
 - Test-time augmentation com flip horizontal
 - Concatenação de features da imagem original e flipped
 
@@ -204,12 +195,12 @@ Na avaliação:
 
 O treinamento inclui:
 
-1. **Split de Validação**: 10% do dataset de treino separado para validação
-2. **Avaliação LFW**: Executada a cada época no processo de rank 0
-3. **Early Stopping**: Patience de 10 épocas sem melhoria
+1. **Split de Validação Interno**: 10% do dataset de treino separado para validação de classificação
+2. **Avaliação Externa (LFW/CelebA)**: Executada a cada época no processo de rank 0 para avaliar qualidade dos embeddings
+3. **Early Stopping**: Patience de 10 épocas sem melhoria na similaridade do dataset de validação externo
 4. **Salvamento de Modelos**:
    - `*_last.ckpt`: Último checkpoint (salvo a cada época)
-   - `*_best.ckpt`: Melhor modelo baseado na similaridade LFW
+   - `*_best.ckpt`: Melhor modelo baseado na similaridade do dataset de validação externo (LFW ou CelebA)
 
 ### Conteúdo dos Checkpoints
 
@@ -239,10 +230,12 @@ data/train/
 
 Cada subdiretório representa uma identidade diferente.
 
+**Nota**: O dataset VggFaceHQ pode conter imagens de tamanhos variados, mas todas serão automaticamente redimensionadas para 112x112 durante o pré-processamento.
+
 ### Dataset LFW para Validação
 
 ```
-data/val/
+data/lfw/val/
 ├── lfw_ann.txt
 └── <pessoa_nome>/
     ├── <pessoa_nome>_0001.jpg
@@ -259,7 +252,34 @@ pessoa2_nome 0001 0003
 ...
 ```
 
-Cada linha representa um par positivo (mesma pessoa).
+Cada linha representa um par positivo (mesma pessoa) com o formato: `nome_pessoa numero_img1 numero_img2`
+
+### Dataset CelebA para Validação
+
+```
+data/celeba/
+├── celeba_pairs.txt
+└── img_align_celeba/
+    └── img_align_celeba/
+        ├── 000001.jpg
+        ├── 000002.jpg
+        ├── 000003.jpg
+        └── ...
+```
+
+#### Formato do arquivo celeba_pairs.txt
+
+```
+header_line
+000001.jpg 000045.jpg
+000001.jpg 000123.jpg
+000002.jpg 000089.jpg
+...
+```
+
+Cada linha representa um par positivo (mesma pessoa) com o formato: `imagem1.jpg imagem2.jpg`
+
+**Nota**: O arquivo deve conter apenas pares de imagens da mesma identidade. A primeira linha é um header e é ignorada.
 
 ## Características Técnicas
 
@@ -302,25 +322,25 @@ Nota: Pode reduzir a performance.
 
 - **Loss**: CrossEntropyLoss
 - **Training Accuracy**: Acurácia de classificação no batch atual
-- **Validation Accuracy**: Acurácia no subset de validação interna
-- **LFW Similarity**: Similaridade média entre pares positivos no LFW
+- **Internal Validation Accuracy**: Acurácia no subset de validação interna (10% do dataset de treino)
+- **External Validation Similarity**: Similaridade média entre pares positivos no dataset de validação externo (LFW ou CelebA)
 
 ### Logs
 
 O treinamento imprime logs a cada `--print-freq` batches:
 - Época atual
 - Loss médio
-- Acurácia média
+- Acurácia média de treinamento
 - Learning rate atual
 - Tempo de processamento
 
-## Referências
+Ao final de cada época:
+- Acurácia de validação interna (classificação no subset do dataset de treino)
+- Similaridade de validação externa (LFW ou CelebA)
 
-Este projeto implementa conceitos dos seguintes trabalhos:
+### Critério de Best Model
 
-- **SphereFace**: Deep Hypersphere Embedding for Face Recognition (Liu et al., 2017)
-- **CosFace**: Large Margin Cosine Loss for Deep Face Recognition (Wang et al., 2018)
-- **ArcFace**: Additive Angular Margin Loss for Deep Face Recognition (Deng et al., 2019)
+O melhor modelo é selecionado com base na **similaridade média do dataset de validação externo** (LFW ou CelebA), não na acurácia de classificação interna. Isso garante que o modelo aprenda embeddings discriminativos que generalizam bem para identidades não vistas.
 
 ## Licença
 
