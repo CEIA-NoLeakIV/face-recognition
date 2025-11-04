@@ -1,6 +1,16 @@
 import os
 import numpy as np
 from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    roc_curve, 
+    auc, 
+    f1_score, 
+    precision_score, 
+    recall_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
 
 import torch
 from torchvision import transforms
@@ -57,6 +67,16 @@ def extract_deep_features(model, image, device):
 
 
 def k_fold_split(n=6000, n_folds=10):
+    """
+    Creates k-fold splits for cross-validation.
+    
+    Args:
+        n (int): Total number of samples
+        n_folds (int): Number of folds
+        
+    Returns:
+        list: List of [train_indices, test_indices] for each fold
+    """
     folds = []
     base = list(range(n))
     fold_size = n // n_folds
@@ -71,14 +91,14 @@ def k_fold_split(n=6000, n_folds=10):
 
 def eval_accuracy(predictions, threshold):
     """
-    Calculate accuracy based on predictions and threshold.
+    Calculates accuracy for binary classification.
     
     Args:
-        predictions: Array with [path1, path2, distance, gt]
-        threshold: Similarity threshold for positive match
+        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
+        threshold (float): Threshold for classification
         
     Returns:
-        accuracy: Classification accuracy
+        float: Accuracy score
     """
     y_true = []
     y_pred = []
@@ -95,100 +115,170 @@ def eval_accuracy(predictions, threshold):
     return accuracy
 
 
-def calculate_tar_far_frr(predictions, threshold):
+def find_best_threshold(predictions, thresholds):
     """
-    Calculate TAR (True Acceptance Rate), FAR (False Acceptance Rate), 
-    and FRR (False Rejection Rate) at a given threshold.
-    
-    Based on standard biometric evaluation metrics:
-    - TAR = True Positives / (True Positives + False Negatives) = 1 - FRR
-    - FAR = False Positives / (False Positives + True Negatives)
-    - FRR = False Negatives / (False Negatives + True Positives) = 1 - TAR
+    Finds the best threshold that maximizes accuracy.
     
     Args:
-        predictions: Array with [path1, path2, similarity, ground_truth]
-                    ground_truth: '1' for same person, '0' for different
-        threshold: Similarity threshold for classification
+        predictions (np.ndarray): Predictions array
+        thresholds (list): List of thresholds to test
         
     Returns:
-        dict with 'TAR', 'FAR', 'FRR' values
+        float: Best threshold
     """
-    # Extract similarities and ground truth
-    similarities = predictions[:, 2].astype(float)
-    ground_truth = predictions[:, 3].astype(int)
+    best_accuracy = 0
+    best_threshold = 0
+
+    for threshold in thresholds:
+        accuracy = eval_accuracy(predictions, threshold)
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_threshold = threshold
+
+    return best_threshold
+
+
+def compute_roc_curve(predictions, save_path=None):
+    """
+    Computes ROC curve and AUC score.
     
-    # Predictions based on threshold
-    predictions_binary = (similarities > threshold).astype(int)
+    Args:
+        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
+        save_path (str, optional): Path to save ROC curve plot
+        
+    Returns:
+        dict: Dictionary containing fpr, tpr, auc_score, and roc_thresholds
+    """
+    # Extract ground truth and similarity scores
+    y_true = predictions[:, 3].astype(int)
+    y_scores = predictions[:, 2].astype(float)
     
-    # Calculate confusion matrix components
-    # Genuine pairs (same person, gt=1)
-    genuine_mask = (ground_truth == 1)
-    genuine_accepted = np.sum((predictions_binary == 1) & genuine_mask)  # True Positives
-    genuine_rejected = np.sum((predictions_binary == 0) & genuine_mask)  # False Negatives
+    # Compute ROC curve
+    fpr, tpr, roc_thresholds = roc_curve(y_true, y_scores)
+    auc_score = auc(fpr, tpr)
     
-    # Impostor pairs (different person, gt=0)
-    impostor_mask = (ground_truth == 0)
-    impostor_accepted = np.sum((predictions_binary == 1) & impostor_mask)  # False Positives
-    impostor_rejected = np.sum((predictions_binary == 0) & impostor_mask)  # True Negatives
-    
-    # Calculate metrics
-    # TAR (True Acceptance Rate) = TP / (TP + FN)
-    total_genuine = genuine_accepted + genuine_rejected
-    TAR = genuine_accepted / total_genuine if total_genuine > 0 else 0.0
-    
-    # FAR (False Acceptance Rate) = FP / (FP + TN)
-    total_impostor = impostor_accepted + impostor_rejected
-    FAR = impostor_accepted / total_impostor if total_impostor > 0 else 0.0
-    
-    # FRR (False Rejection Rate) = FN / (FN + TP) = 1 - TAR
-    FRR = genuine_rejected / total_genuine if total_genuine > 0 else 0.0
+    # Plot ROC curve if save_path is provided
+    if save_path:
+        plt.figure(figsize=(8, 6))
+        plt.plot(fpr, tpr, color='darkorange', lw=2, 
+                label=f'ROC curve (AUC = {auc_score:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+                label='Random Classifier')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver Operating Characteristic (ROC) Curve')
+        plt.legend(loc="lower right")
+        plt.grid(alpha=0.3)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"ROC curve saved to: {save_path}")
     
     return {
-        'TAR': TAR,
-        'FAR': FAR,
-        'FRR': FRR,
-        'threshold': threshold
+        'fpr': fpr,
+        'tpr': tpr,
+        'auc_score': auc_score,
+        'roc_thresholds': roc_thresholds
     }
 
 
-def find_best_threshold(predictions, thresholds=None):
+def compute_f1_score(predictions, threshold):
     """
-    Find the best threshold by minimizing Equal Error Rate (EER).
-    EER is the point where FAR = FRR.
+    Computes F1 score.
     
     Args:
-        predictions: Array with predictions
-        thresholds: List of thresholds to test (optional)
+        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
+        threshold (float): Classification threshold
         
     Returns:
-        best_threshold: Threshold with minimum EER
-        best_metrics: Metrics at best threshold
+        float: F1 score
     """
-    if thresholds is None:
-        # Generate thresholds based on similarity distribution
-        similarities = predictions[:, 2].astype(float)
-        thresholds = np.linspace(similarities.min(), similarities.max(), 100)
+    y_true = predictions[:, 3].astype(int)
+    y_scores = predictions[:, 2].astype(float)
+    y_pred = (y_scores > threshold).astype(int)
     
-    best_eer = float('inf')
-    best_threshold = 0.35
-    best_metrics = None
+    f1 = f1_score(y_true, y_pred)
+    return f1
+
+
+def compute_precision(predictions, threshold):
+    """
+    Computes precision score.
     
-    for threshold in thresholds:
-        metrics = calculate_tar_far_frr(predictions, threshold)
-        # EER is where FAR ≈ FRR
-        eer = abs(metrics['FAR'] - metrics['FRR'])
+    Args:
+        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
+        threshold (float): Classification threshold
         
-        if eer < best_eer:
-            best_eer = eer
-            best_threshold = threshold
-            best_metrics = metrics
-    
-    return best_threshold, best_metrics
-
-
-def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val'):
+    Returns:
+        float: Precision score
     """
-    Evaluate the model on validation dataset (LFW or CelebA).
+    y_true = predictions[:, 3].astype(int)
+    y_scores = predictions[:, 2].astype(float)
+    y_pred = (y_scores > threshold).astype(int)
+    
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    return precision
+
+
+def compute_recall(predictions, threshold):
+    """
+    Computes recall score.
+    
+    Args:
+        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
+        threshold (float): Classification threshold
+        
+    Returns:
+        float: Recall score
+    """
+    y_true = predictions[:, 3].astype(int)
+    y_scores = predictions[:, 2].astype(float)
+    y_pred = (y_scores > threshold).astype(int)
+    
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    return recall
+
+
+def compute_confusion_matrix(predictions, threshold, save_path=None):
+    """
+    Computes and plots confusion matrix.
+    
+    Args:
+        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
+        threshold (float): Classification threshold
+        save_path (str, optional): Path to save confusion matrix plot
+        
+    Returns:
+        np.ndarray: Confusion matrix
+    """
+    y_true = predictions[:, 3].astype(int)
+    y_scores = predictions[:, 2].astype(float)
+    y_pred = (y_scores > threshold).astype(int)
+    
+    # Compute confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Plot confusion matrix if save_path is provided
+    if save_path:
+        plt.figure(figsize=(8, 6))
+        disp = ConfusionMatrixDisplay(
+            confusion_matrix=cm,
+            display_labels=['Different', 'Same']
+        )
+        disp.plot(cmap='Blues', values_format='d')
+        plt.title('Confusion Matrix')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Confusion matrix saved to: {save_path}")
+    
+    return cm
+
+
+def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val', 
+         compute_metrics=True, save_plots=False, plots_dir='weights'):
+    """
+    Evaluate the model on validation dataset (LFW or CelebA) with comprehensive metrics.
     
     Args:
         model: The model to evaluate
@@ -196,11 +286,15 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         device: Device to run evaluation on
         val_dataset: Dataset to use for validation ('lfw' or 'celeba')
         val_root: Root directory of validation data
+        compute_metrics: Whether to compute additional metrics (ROC, F1, etc.)
+        save_plots: Whether to save plots (ROC curve, confusion matrix)
+        plots_dir: Directory to save plots
         
     Returns:
-        similarity_score: Average similarity score
-        predictions: Array with all predictions
-        metrics: Dict with TAR, FAR, FRR at default threshold (0.35)
+        tuple: (accuracy_proxy, predictions, metrics_dict)
+            - accuracy_proxy: Mean similarity score
+            - predictions: Array of predictions
+            - metrics_dict: Dictionary with all computed metrics
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -291,24 +385,88 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
     print(f'{dataset_name} - Simplified Evaluation (Positive Pairs Only):')
     print(f'Mean Similarity: {mean_similarity:.4f} | Standard Deviation: {std_similarity:.4f}')
 
-    # Calculate TAR, FAR, FRR at default threshold (0.35)
-    default_threshold = 0.35
-    metrics = calculate_tar_far_frr(predicts, default_threshold)
+    # Initialize metrics dictionary
+    metrics_dict = {
+        'mean_similarity': mean_similarity,
+        'std_similarity': std_similarity
+    }
     
-    print(f'\nMetrics at threshold {default_threshold}:')
-    print(f'TAR (True Acceptance Rate): {metrics["TAR"]:.4f}')
-    print(f'FAR (False Acceptance Rate): {metrics["FAR"]:.4f}')
-    print(f'FRR (False Rejection Rate): {metrics["FRR"]:.4f}')
-    
+    # Compute additional metrics if requested
+    if compute_metrics and len(predicts) > 0:
+        # Find best threshold
+        thresholds = np.linspace(0.2, 0.8, 100)
+        best_threshold = find_best_threshold(predicts, thresholds)
+        
+        # Compute all metrics
+        accuracy = eval_accuracy(predicts, best_threshold)
+        f1 = compute_f1_score(predicts, best_threshold)
+        precision = compute_precision(predicts, best_threshold)
+        recall = compute_recall(predicts, best_threshold)
+        
+        # Add to metrics dictionary
+        metrics_dict.update({
+            'best_threshold': best_threshold,
+            'accuracy': accuracy,
+            'f1_score': f1,
+            'precision': precision,
+            'recall': recall
+        })
+        
+        # Compute ROC curve
+        if save_plots:
+            os.makedirs(plots_dir, exist_ok=True)
+            roc_save_path = os.path.join(plots_dir, f'{val_dataset}_roc_curve.png')
+            cm_save_path = os.path.join(plots_dir, f'{val_dataset}_confusion_matrix.png')
+        else:
+            roc_save_path = None
+            cm_save_path = None
+            
+        roc_results = compute_roc_curve(predicts, save_path=roc_save_path)
+        cm = compute_confusion_matrix(predicts, best_threshold, save_path=cm_save_path)
+        
+        # Add ROC results to metrics
+        metrics_dict.update({
+            'auc_score': roc_results['auc_score'],
+            'confusion_matrix': cm
+        })
+        
+        # Print metrics
+        print(f'\nAdditional Metrics (Threshold: {best_threshold:.4f}):')
+        print(f'  Accuracy:  {accuracy:.4f}')
+        print(f'  F1 Score:  {f1:.4f}')
+        print(f'  Precision: {precision:.4f}')
+        print(f'  Recall:    {recall:.4f}')
+        print(f'  AUC Score: {roc_results["auc_score"]:.4f}')
+        print(f'\nConfusion Matrix:')
+        print(f'  TN: {cm[0,0]:5d}  FP: {cm[0,1]:5d}')
+        print(f'  FN: {cm[1,0]:5d}  TP: {cm[1,1]:5d}')
+
     accuracy_proxy = mean_similarity 
     
-    return accuracy_proxy, predicts, metrics
+    return accuracy_proxy, predicts, metrics_dict
 
 
 if __name__ == '__main__':
-    _, result, _ = eval(sphere20(512).to('cuda'), model_path='weights/sphere20_mcp.pth')
-    _, result, _ = eval(sphere36(512).to('cuda'), model_path='weights/sphere36_mcp.pth')
-    _, result, _ = eval(MobileNetV1(512).to('cuda'), model_path='weights/mobilenetv1_mcp.pth')
-    _, result, _ = eval(MobileNetV2(512).to('cuda'), model_path='weights/mobilenetv2_mcp.pth')
-    _, result, _ = eval(mobilenet_v3_small(512).to('cuda'), model_path='weights/mobilenetv3_small_mcp.pth')
-    _, result, _ = eval(mobilenet_v3_large(512).to('cuda'), model_path='weights/mobilenetv3_large_mcp.pth')
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    models_to_test = [
+        (sphere20(512), 'weights/sphere20_mcp.pth'),
+        (sphere36(512), 'weights/sphere36_mcp.pth'),
+        (MobileNetV1(512), 'weights/mobilenetv1_mcp.pth'),
+        (MobileNetV2(512), 'weights/mobilenetv2_mcp.pth'),
+        (mobilenet_v3_small(512), 'weights/mobilenetv3_small_mcp.pth'),
+        (mobilenet_v3_large(512), 'weights/mobilenetv3_large_mcp.pth')
+    ]
+    
+    for model, model_path in models_to_test:
+        print(f"\n{'='*70}")
+        print(f"Evaluating: {model_path}")
+        print(f"{'='*70}")
+        _, _, metrics = eval(
+            model.to(device), 
+            model_path=model_path,
+            compute_metrics=True,
+            save_plots=True,
+            plots_dir='weights'
+        )

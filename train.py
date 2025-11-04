@@ -19,6 +19,7 @@ from utils.general import (
     EarlyStopping,
     LOGGER,
 )
+from utils.training_tracker import TrainingTracker
 
 from models import (
     sphere20,
@@ -144,6 +145,7 @@ def parse_arguments():
 
     return parser.parse_args()
 
+
 def validate_model(model, classification_head, val_loader, device):
     """Validates the model on validation subset"""
     model.eval()
@@ -198,7 +200,8 @@ def train_one_epoch(
     device,
     epoch,
     params
-) -> None:
+):
+    """Training loop for one epoch - returns average loss and accuracy"""
     model.train()
     losses = AverageMeter("Avg Loss", ":6.3f")
     batch_time = AverageMeter("Batch Time", ":4.3f")
@@ -206,6 +209,8 @@ def train_one_epoch(
     last_batch_idx = len(data_loader) - 1
 
     start_time = time.time()
+    epoch_start_time = time.time()
+    
     for batch_idx, (images, target) in enumerate(data_loader):
         last_batch = last_batch_idx == batch_idx
 
@@ -266,14 +271,19 @@ def train_one_epoch(
             )
             LOGGER.info(log)
 
+    # Calculate total epoch time
+    epoch_time = time.time() - epoch_start_time
+
     # End-of-epoch summary
     log = (
         f'Epoch [{epoch}/{params.epochs}] Summary: '
         f'Loss: {losses.avg:6.3f}, '
         f'Accuracy: {accuracy_meter.avg:4.2f}%, '
-        f'Total Time: {batch_time.sum:4.3f}s'
+        f'Total Time: {epoch_time:4.1f}s'
     )
     LOGGER.info(log)
+    
+    return losses.avg, accuracy_meter.avg / 100.0, epoch_time  # Return as fraction
 
 
 def main(params):
@@ -401,7 +411,21 @@ def main(params):
     else:
         raise ValueError(f"Unsupported lr_scheduler type: {params.lr_scheduler}")
 
+    # ============ INITIALIZE TRAINING TRACKER ============
+    experiment_name = f"{params.network}_{params.classifier}_{params.database}"
+    tracker = TrainingTracker(
+        save_dir=params.save_path,
+        experiment_name=experiment_name
+    )
+    LOGGER.info(f"📊 Training Tracker initialized: {experiment_name}")
+    
     start_epoch = 0
+    best_metrics = {
+        'similarity': 0.0,
+        'auc': 0.0,
+        'f1': 0.0
+    }
+    
     if params.checkpoint and os.path.isfile(params.checkpoint):
         ckpt = torch.load(params.checkpoint, map_location="cpu")
 
@@ -416,10 +440,17 @@ def main(params):
                     state[k] = v.to(device)
 
         start_epoch = ckpt['epoch']
+        if 'best_metrics' in ckpt:
+            best_metrics = ckpt['best_metrics']
+        
+        # Restore training history if available
+        if 'training_history' in ckpt:
+            tracker.history = ckpt['training_history']
+            LOGGER.info(f"📊 Restored training history from checkpoint")
+            
         LOGGER.info(f'Resumed training from {params.checkpoint}, starting at epoch {start_epoch}')
 
-    best_accuracy = 0.0
-    curr_accuracy = 0.0
+    curr_metrics = {}
     early_stopping = EarlyStopping(patience=10)
 
     # Training loop
@@ -427,7 +458,9 @@ def main(params):
     for epoch in range(start_epoch, params.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(
+        
+        # Train one epoch and get metrics
+        train_loss, train_accuracy, epoch_time = train_one_epoch(
             model,
             classification_head,
             criterion,
@@ -437,64 +470,124 @@ def main(params):
             epoch,
             params
         )
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
         lr_scheduler.step()
 
         base_filename = f'{params.network}_{params.classifier}'
-
         last_save_path = os.path.join(params.save_path, f'{base_filename}_last.ckpt')
 
-        # Save the last checkpoint
+        # Internal validation
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=params.batch_size,
+            shuffle=False,
+            num_workers=params.num_workers,
+            pin_memory=True
+        )
+        val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
+
+        if params.local_rank == 0:
+            # External validation with all metrics and plots
+            LOGGER.info(f'\n{"="*70}')
+            LOGGER.info(f'External Validation - Epoch {epoch + 1}')
+            LOGGER.info(f'{"="*70}')
+            
+            # Create epoch-specific directory for plots
+            epoch_plots_dir = os.path.join(params.save_path, f'epoch_{epoch+1:03d}')
+            
+            curr_similarity, _, curr_metrics = evaluate.eval(
+                model_without_ddp, 
+                device=device,
+                val_dataset=params.val_dataset,
+                val_root=params.val_root,
+                compute_metrics=True,
+                save_plots=True,  # Always save plots
+                plots_dir=epoch_plots_dir
+            )
+            
+            # Log metrics to tracker
+            tracker.log_epoch(
+                epoch=epoch + 1,
+                train_loss=train_loss,
+                train_accuracy=train_accuracy,
+                val_accuracy=val_accuracy,
+                external_metrics=curr_metrics,
+                learning_rate=current_lr,
+                epoch_time=epoch_time
+            )
+            
+            # Log all metrics
+            LOGGER.info(f'\nInternal Validation ({params.database} subset): {val_accuracy:.4f}')
+            LOGGER.info(f'\nExternal Validation Metrics ({params.val_dataset.upper()}):')
+            LOGGER.info(f'  Mean Similarity: {curr_metrics["mean_similarity"]:.4f}')
+            LOGGER.info(f'  Best Threshold:  {curr_metrics.get("best_threshold", 0.35):.4f}')
+            LOGGER.info(f'  Accuracy:        {curr_metrics.get("accuracy", 0.0):.4f}')
+            LOGGER.info(f'  F1 Score:        {curr_metrics.get("f1_score", 0.0):.4f}')
+            LOGGER.info(f'  Precision:       {curr_metrics.get("precision", 0.0):.4f}')
+            LOGGER.info(f'  Recall:          {curr_metrics.get("recall", 0.0):.4f}')
+            LOGGER.info(f'  AUC Score:       {curr_metrics.get("auc_score", 0.0):.4f}')
+            LOGGER.info(f'{"="*70}\n')
+
+        # Save checkpoint with training history
         checkpoint = {
             'epoch': epoch + 1,
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
             'lr_scheduler': lr_scheduler.state_dict(),
+            'best_metrics': best_metrics,
+            'training_history': tracker.history,  # Include history
             'args': params
         }
-
+        
         save_on_master(checkpoint, last_save_path)
 
-        if params.local_rank == 0:
-            # Validation Evaluation with new metrics
-            curr_accuracy, predictions, metrics = evaluate.eval(
-                model_without_ddp, 
-                device=device,
-                val_dataset=params.val_dataset,
-                val_root=params.val_root
-            )
-            
-            # Log the new metrics (TAR, FAR, FRR)
-            LOGGER.info(f'Validation Metrics at Epoch {epoch+1}:')
-            LOGGER.info(f'  Similarity: {curr_accuracy:.4f}')
-            LOGGER.info(f'  TAR (True Acceptance Rate): {metrics["TAR"]:.4f}')
-            LOGGER.info(f'  FAR (False Acceptance Rate): {metrics["FAR"]:.4f}')
-            LOGGER.info(f'  FRR (False Rejection Rate): {metrics["FRR"]:.4f}')
-            
-            # Internal validation (for monitoring only)
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=params.batch_size,
-                shuffle=False,
-                num_workers=params.num_workers,
-                pin_memory=True
-            )
-            
-            val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
-            LOGGER.info(f'Internal validation accuracy ({params.database} subset): {val_accuracy:.4f}')
-
-        if early_stopping(epoch, curr_accuracy):
+        if early_stopping(epoch, curr_similarity):
             break
 
-        # Save the best model if validation similarity improves
-        if curr_accuracy > best_accuracy:
-            best_accuracy = curr_accuracy
+        # Save best model based on multiple criteria
+        is_best = False
+        best_type = ''
+        
+        # Check if any metric improved
+        if curr_similarity > best_metrics['similarity']:
+            best_metrics['similarity'] = curr_similarity
+            is_best = True
+            best_type = 'similarity'
+            
+        if curr_metrics.get('auc_score', 0.0) > best_metrics['auc']:
+            best_metrics['auc'] = curr_metrics['auc_score']
+            is_best = True
+            best_type = 'auc'
+            
+        if curr_metrics.get('f1_score', 0.0) > best_metrics['f1']:
+            best_metrics['f1'] = curr_metrics['f1_score']
+            is_best = True
+            best_type = 'f1'
+        
+        if is_best:
+            checkpoint['best_metrics'] = best_metrics
             save_on_master(checkpoint, os.path.join(params.save_path, f'{base_filename}_best.ckpt'))
             LOGGER.info(
-                f"New best {params.val_dataset.upper()} similarity: {best_accuracy:.4f}. "
+                f"New best {best_type.upper()}: {best_metrics[best_type]:.4f}. "
                 f"Model saved to {params.save_path} with `_best` postfix."
             )
 
-    LOGGER.info('Training completed.')
+    # ============ GENERATE FINAL REPORT ============
+    if params.local_rank == 0:
+        LOGGER.info('\n' + '='*70)
+        LOGGER.info('TRAINING COMPLETED - GENERATING FINAL REPORT')
+        LOGGER.info('='*70 + '\n')
+        
+        report_dir = tracker.generate_final_report()
+        
+        LOGGER.info('\nBest Metrics Achieved:')
+        LOGGER.info(f'  Similarity: {best_metrics["similarity"]:.4f}')
+        LOGGER.info(f'  AUC:        {best_metrics["auc"]:.4f}')
+        LOGGER.info(f'  F1 Score:   {best_metrics["f1"]:.4f}')
+        LOGGER.info(f'\n📁 Final report saved to: {report_dir}')
 
 
 if __name__ == '__main__':

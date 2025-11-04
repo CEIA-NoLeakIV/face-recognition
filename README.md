@@ -6,6 +6,43 @@ Framework de treinamento para reconhecimento facial baseado em CNNs com suporte 
 
 Este projeto implementa um pipeline completo para treinamento e avaliação de modelos de reconhecimento facial. Suporta diferentes arquiteturas de redes neurais e métodos de loss baseados em margem angular para aprendizado de embeddings discriminativos.
 
+## 🆕 Novas Funcionalidades (v2.0)
+
+### Sistema de Tracking Automático de Treinamento
+
+- **TrainingTracker**: Sistema completo que rastreia métricas automaticamente durante o treinamento
+- **Plots Automáticos**: Gera visualizações profissionais a cada época sem necessidade de flags
+- **Relatório Final**: Cria relatório completo com todas as métricas e gráficos ao final do treinamento
+- **Histórico Preservado**: Salva histórico completo em checkpoints para análise posterior
+
+### Métricas Expandidas
+
+Além das métricas originais, agora calcula automaticamente:
+
+- **F1 Score**: Harmonic mean de precision e recall
+- **Precision**: Proporção de verdadeiros positivos entre predições positivas
+- **Recall**: Proporção de verdadeiros positivos identificados corretamente
+- **AUC Score**: Área sob a curva ROC
+- **ROC Curve**: Curva ROC completa com visualização
+- **Confusion Matrix**: Matriz de confusão com evolução ao longo do treinamento
+- **TAR/FAR/FRR**: Métricas biométricas (True Accept Rate, False Accept Rate, False Reject Rate)
+
+### Visualizações Geradas
+
+O sistema agora gera automaticamente:
+
+**Durante o treinamento (por época):**
+- `weights/epoch_XXX/lfw_roc_curve.png` - ROC curve
+- `weights/epoch_XXX/lfw_confusion_matrix.png` - Confusion matrix
+
+**Ao final do treinamento:**
+- `weights/final_report/training_curves.png` - Curvas de loss, accuracy, F1, AUC, similarity
+- `weights/final_report/confusion_matrix_evolution.png` - Evolução da matriz (início/meio/fim)
+- `weights/final_report/learning_rate_schedule.png` - Schedule do learning rate
+- `weights/final_report/all_metrics_overview.png` - Overview de todas as métricas
+- `weights/final_report/training_history.json` - Histórico completo em JSON
+- `weights/final_report/training_summary.txt` - Resumo estatístico
+
 ## Arquiteturas Suportadas
 
 ### Backbones Disponíveis
@@ -17,7 +54,7 @@ Este projeto implementa um pipeline completo para treinamento e avaliação de m
 
 - **MCP (Margin Cosine Product)**: Implementação do CosFace
 - **AL (Angle Linear)**: Implementação do SphereFace
-- **ARC**: Implementação do ArcFace (*)
+- **ARC**: Implementação do ArcFace
 - **L (Linear)**: Classificador linear padrão
 
 ## Datasets Suportados
@@ -46,11 +83,12 @@ O framework suporta os seguintes datasets para validação:
 │   ├── dataset.py          # Carregamento de dados
 │   ├── metrics.py          # Loss functions
 │   ├── general.py          # Funções auxiliares
-│   └── validation_split.py # Split de validação
-├── train.py                # Script de treinamento
-├── evaluate.py             # Avaliação em LFW/CelebA
+│   ├── validation_split.py # Split de validação
+│   └── training_tracker.py # 🆕 Sistema de tracking
+├── train.py                # Script de treinamento (atualizado)
+├── evaluate.py             # Avaliação em LFW/CelebA (atualizado)
 ├── inference.py            # Inferência e comparação
-└── requirements.txt        # Dependências do projeto
+└── requirements.txt        # Dependências do projeto (atualizado)
 ```
 
 ## Instalação
@@ -61,15 +99,29 @@ O framework suporta os seguintes datasets para validação:
 pip install -r requirements.txt
 ```
 
-### Resolução de Problemas com CUDA
+### Dependências Atualizadas
 
-Caso o PyTorch não reconheça a versão do CUDA instalada no sistema, instale manualmente uma versão compatível
+```txt
+numpy==2.1.3
+opencv-python==4.10.0.84
+pillow==11.0.0
+tqdm==4.67.1
+torch==2.5.1
+torchaudio==2.5.1
+torchvision==0.20.1
+uniface
+onnxruntime
+scikit-learn==1.5.2      # 🆕 Para métricas
+matplotlib==3.9.2         # 🆕 Para visualizações
+seaborn==0.13.2          # 🆕 Para plots profissionais
+pandas==2.2.3            # 🆕 Para análise de dados
+```
 
 ## Uso
 
 ### Treinamento
 
-Comando básico para treinamento:
+Comando básico para treinamento (sem mudanças no comando):
 
 ```bash
 python train.py \
@@ -95,7 +147,7 @@ python train.py \
 - `--val-root`: Caminho para o diretório do dataset de validação - Padrão: data/lfw/val
 
 **Modelo:**
-- `--network`: Arquitetura da rede (sphere20, sphere36, sphere64, mobilenetv1, mobilenetv2, mobilenetv3_small, mobilenetv3_large)
+- `--network`: Arquitetura da rede (sphere20, mobilenetv3_large, etc.)
 - `--classifier`: Tipo de loss function (MCP, AL, ARC, L)
 
 **Hiperparâmetros:**
@@ -114,6 +166,52 @@ python train.py \
 - `--num-workers`: Número de workers para DataLoader (padrão: 8)
 - `--print-freq`: Frequência de impressão de logs (padrão: 100)
 
+### 🆕 O Que Acontece Automaticamente Durante o Treinamento
+
+O sistema agora:
+
+1. **Rastreia todas as métricas** automaticamente (loss, accuracy, F1, precision, recall, AUC, etc.)
+2. **Salva plots a cada época** em `weights/epoch_XXX/`
+3. **Exibe métricas completas** nos logs a cada época
+4. **Gera relatório final** completo em `weights/final_report/` ao terminar
+5. **Preserva histórico** em checkpoints (pode retomar com histórico intacto)
+
+### 🆕 Exemplo de Logs Durante Treinamento
+
+```
+==================================================
+External Validation - Epoch 1
+==================================================
+LFW - Simplified Evaluation (Positive Pairs Only):
+Mean Similarity: 0.6256 | Standard Deviation: 0.1339
+
+Additional Metrics (Threshold: 0.3847):
+  Accuracy:  0.9650
+  F1 Score:  0.9823
+  Precision: 0.9651
+  Recall:    1.0000
+  AUC Score: 0.9956
+
+Confusion Matrix:
+  TN:     0  FP:   105
+  FN:     0  TP:  2895
+
+Internal Validation (VggFace2 subset): 0.8523
+
+External Validation Metrics (LFW):
+  Mean Similarity: 0.6256
+  Best Threshold:  0.3847
+  Accuracy:        0.9650
+  F1 Score:        0.9823
+  Precision:       0.9651
+  Recall:          1.0000
+  AUC Score:       0.9956
+==================================================
+
+✅ ROC curve saved to: weights/epoch_001/lfw_roc_curve.png
+✅ Confusion matrix saved to: weights/epoch_001/lfw_confusion_matrix.png
+```
+
 ### Retomar Treinamento
 
 Para continuar um treinamento anterior:
@@ -127,23 +225,27 @@ python train.py \
     --classifier MCP
 ```
 
+**🆕 O histórico de métricas é preservado automaticamente!**
+
 ### Avaliação
 
 Avaliação standalone em LFW ou CelebA:
 
-**Avaliar em LFW (padrão):**
 ```bash
 python evaluate.py
 ```
 
-**Avaliar em CelebA:**
-```bash
-# Edite evaluate.py e ajuste os parâmetros na chamada da função eval()
-# Exemplo:
-eval(model, model_path='weights/model.pth', val_dataset='celeba', val_root='data/celeba')
-```
+O script avalia os modelos treinados e calcula **todas as métricas** incluindo as novas (F1, Precision, Recall, AUC, ROC, Confusion Matrix).
 
-O script avalia os modelos treinados e calcula a similaridade média entre pares de faces positivos no dataset de validação.
+### 🆕 Avaliação com Novas Métricas no Notebook
+
+O notebook `1.Notebooks/Eval.ipynb` foi atualizado com novas células para:
+
+- Calcular todas as 12+ métricas automaticamente
+- Visualizar ROC Curve
+- Visualizar Confusion Matrix
+- Analisar sensibilidade ao threshold
+- Exportar resultados completos em JSON e CSV
 
 ### Inferência
 
@@ -157,12 +259,6 @@ O script de inferência permite:
 - Comparar duas imagens faciais
 - Extrair embeddings de múltiplas imagens
 - Calcular similaridade entre faces
-
-Edite as variáveis no final do arquivo `inference.py` para configurar:
-- Nome do modelo
-- Caminho dos pesos
-- Caminhos das imagens
-- Threshold de similaridade
 
 ## Detalhes de Implementação
 
@@ -196,20 +292,22 @@ As imagens são processadas da seguinte forma:
 O treinamento inclui:
 
 1. **Split de Validação Interno**: 10% do dataset de treino separado para validação de classificação
-2. **Avaliação Externa (LFW/CelebA)**: Executada a cada época no processo de rank 0 para avaliar qualidade dos embeddings
-3. **Early Stopping**: Patience de 10 épocas sem melhoria na similaridade do dataset de validação externo
+2. **Avaliação Externa (LFW/CelebA)**: Executada a cada época para avaliar qualidade dos embeddings
+3. **Early Stopping**: Patience de 10 épocas sem melhoria
 4. **Salvamento de Modelos**:
    - `*_last.ckpt`: Último checkpoint (salvo a cada época)
-   - `*_best.ckpt`: Melhor modelo baseado na similaridade do dataset de validação externo (LFW ou CelebA)
+   - `*_best.ckpt`: Melhor modelo baseado nas métricas de validação
 
-### Conteúdo dos Checkpoints
+### 🆕 Conteúdo dos Checkpoints (Atualizado)
 
-Os checkpoints salvos contêm:
+Os checkpoints agora salvam:
 - Estado do modelo (pesos)
 - Estado do otimizador
 - Estado do scheduler
 - Época atual
 - Argumentos de treinamento
+- **Histórico completo de treinamento** (todas as métricas de todas as épocas)
+- **Melhores métricas alcançadas** (similarity, AUC, F1)
 
 ## Estrutura de Dados Esperada
 
@@ -228,10 +326,6 @@ data/train/
     └── ...
 ```
 
-Cada subdiretório representa uma identidade diferente.
-
-**Nota**: O dataset VggFaceHQ pode conter imagens de tamanhos variados, mas todas serão automaticamente redimensionadas para 112x112 durante o pré-processamento.
-
 ### Dataset LFW para Validação
 
 ```
@@ -243,17 +337,6 @@ data/lfw/val/
     └── ...
 ```
 
-#### Formato do arquivo lfw_ann.txt
-
-```
-num_pairs
-pessoa1_nome 0001 0002
-pessoa2_nome 0001 0003
-...
-```
-
-Cada linha representa um par positivo (mesma pessoa) com o formato: `nome_pessoa numero_img1 numero_img2`
-
 ### Dataset CelebA para Validação
 
 ```
@@ -263,23 +346,87 @@ data/celeba/
     └── img_align_celeba/
         ├── 000001.jpg
         ├── 000002.jpg
-        ├── 000003.jpg
         └── ...
 ```
 
-#### Formato do arquivo celeba_pairs.txt
+## 🆕 Estrutura de Arquivos Gerados
+
+Após o treinamento, a seguinte estrutura é criada automaticamente:
 
 ```
-header_line
-000001.jpg 000045.jpg
-000001.jpg 000123.jpg
-000002.jpg 000089.jpg
-...
+weights/
+├── <model>_<classifier>_best.ckpt    # Melhor modelo
+├── <model>_<classifier>_last.ckpt    # Último checkpoint
+│
+├── epoch_001/                         # Plots de cada época
+│   ├── lfw_roc_curve.png
+│   └── lfw_confusion_matrix.png
+├── epoch_002/
+│   ├── lfw_roc_curve.png
+│   └── lfw_confusion_matrix.png
+├── ...
+├── epoch_030/
+│   ├── lfw_roc_curve.png
+│   └── lfw_confusion_matrix.png
+│
+└── final_report/                      # Relatório final completo
+    ├── training_curves.png            # Curvas de Loss, Accuracy, F1, AUC, Similarity
+    ├── confusion_matrix_evolution.png # Evolução da matriz (início, meio, fim)
+    ├── learning_rate_schedule.png     # Schedule do learning rate
+    ├── all_metrics_overview.png       # Overview de todas as métricas
+    ├── training_history.json          # Histórico completo em JSON
+    └── training_summary.txt           # Resumo estatístico em texto
 ```
 
-Cada linha representa um par positivo (mesma pessoa) com o formato: `imagem1.jpg imagem2.jpg`
+## Métricas
 
-**Nota**: O arquivo deve conter apenas pares de imagens da mesma identidade. A primeira linha é um header e é ignorada.
+### Durante o Treinamento
+
+- **Loss**: CrossEntropyLoss
+- **Training Accuracy**: Acurácia de classificação no batch atual
+- **Internal Validation Accuracy**: Acurácia no subset de validação interna (10% do dataset de treino)
+- **External Validation Metrics**: Métricas completas no dataset de validação externo (LFW ou CelebA)
+
+### 🆕 Métricas de Validação Externa (Completas)
+
+**Similaridade:**
+- Mean Similarity
+- Standard Deviation
+- Min/Max/Median
+
+**Classificação:**
+- Accuracy (com threshold automático)
+- F1 Score
+- Precision
+- Recall
+- AUC Score
+
+**Biométricas:**
+- TAR (True Acceptance Rate)
+- FAR (False Acceptance Rate)
+- FRR (False Rejection Rate)
+
+**Matrizes:**
+- Confusion Matrix (TN, FP, FN, TP)
+- ROC Curve completa
+
+### Logs
+
+O treinamento imprime logs a cada `--print-freq` batches com todas as métricas.
+
+Ao final de cada época:
+- Acurácia de validação interna
+- **Todas as métricas de validação externa** (12+ métricas)
+- Salvamento automático de plots
+
+### 🆕 Critério de Best Model
+
+O melhor modelo é selecionado com base em **múltiplos critérios**:
+- Mean Similarity (principal)
+- AUC Score
+- F1 Score
+
+Qualquer melhoria em qualquer uma dessas métricas salva o modelo como `_best.ckpt`.
 
 ## Características Técnicas
 
@@ -289,12 +436,7 @@ Todos os modelos geram embeddings de 512 dimensões por padrão.
 
 ### Suporte a GPU
 
-O framework detecta automaticamente GPUs disponíveis e move os modelos para CUDA quando possível. Para forçar uso de CPU:
-
-```bash
-export CUDA_VISIBLE_DEVICES=""
-python train.py [argumentos]
-```
+O framework detecta automaticamente GPUs disponíveis e move os modelos para CUDA quando possível.
 
 ### Treinamento Distribuído
 
@@ -306,42 +448,74 @@ python -m torch.distributed.launch \
     train.py --world-size <num_gpus> [outros argumentos]
 ```
 
-### Treinamento Determinístico
+## 🆕 Análise dos Resultados
 
-Para resultados reprodutíveis:
+### Interpretando as Visualizações
 
-```bash
-python train.py --use-deterministic-algorithms [outros argumentos]
+**training_curves.png** (Principal):
+- Top-Left: Training Loss com melhor época marcada
+- Top-Right: Curvas de Accuracy (Train/Val/External)
+- Bottom-Left: Métricas de classificação (F1, Precision, Recall)
+- Bottom-Right: AUC e Similarity (dual Y-axis)
+
+**confusion_matrix_evolution.png**:
+- Mostra como o modelo aprende ao longo do tempo
+- Três épocas: início, meio, fim
+- Visualiza redução de erros (FP/FN)
+
+**learning_rate_schedule.png**:
+- Curva do learning rate ao longo das épocas
+- Mostra milestones de decay
+
+**all_metrics_overview.png**:
+- Comparação lado-a-lado de todas as métricas
+- 6 gráficos individuais
+
+### Usando o Histórico JSON
+
+```python
+import json
+
+# Carregar histórico
+history = json.load(open('weights/final_report/training_history.json'))
+
+# Acessar métricas
+epochs = history['epochs']
+train_loss = history['train_loss']
+external_auc = history['external_auc']
+f1_scores = history['external_f1']
+
+# Plotar custom
+import matplotlib.pyplot as plt
+plt.plot(epochs, external_auc)
+plt.show()
 ```
-
-Nota: Pode reduzir a performance.
-
-## Métricas
-
-### Durante o Treinamento
-
-- **Loss**: CrossEntropyLoss
-- **Training Accuracy**: Acurácia de classificação no batch atual
-- **Internal Validation Accuracy**: Acurácia no subset de validação interna (10% do dataset de treino)
-- **External Validation Similarity**: Similaridade média entre pares positivos no dataset de validação externo (LFW ou CelebA)
-
-### Logs
-
-O treinamento imprime logs a cada `--print-freq` batches:
-- Época atual
-- Loss médio
-- Acurácia média de treinamento
-- Learning rate atual
-- Tempo de processamento
-
-Ao final de cada época:
-- Acurácia de validação interna (classificação no subset do dataset de treino)
-- Similaridade de validação externa (LFW ou CelebA)
-
-### Critério de Best Model
-
-O melhor modelo é selecionado com base na **similaridade média do dataset de validação externo** (LFW ou CelebA), não na acurácia de classificação interna. Isso garante que o modelo aprenda embeddings discriminativos que generalizam bem para identidades não vistas.
 
 ## Licença
 
 Este projeto é fornecido para fins educacionais e de pesquisa.
+
+## 🆕 Changelog
+
+### v2.0.0 (2024-11-04)
+
+**Adicionado:**
+- Sistema TrainingTracker para rastreamento automático de métricas
+- 12+ novas métricas de avaliação (F1, Precision, Recall, AUC, TAR, FAR, FRR)
+- Visualizações automáticas (4 tipos de plots profissionais)
+- Relatório final completo com todas as métricas
+- Histórico preservado em checkpoints
+- ROC Curves automáticas
+- Confusion Matrix com evolução
+- Learning Rate schedule visualization
+
+**Modificado:**
+- `train.py` - Integração com TrainingTracker
+- `evaluate.py` - Métricas expandidas com visualizações
+- `Eval.ipynb` - 7 novas células com análises completas
+- `requirements.txt` - Novas dependências (scikit-learn, matplotlib, seaborn, pandas)
+
+**Comportamento:**
+- Plots agora são **sempre** salvos automaticamente (sem necessidade de flags)
+- Todas as métricas são calculadas automaticamente a cada época
+- Relatório final é gerado automaticamente ao término do treinamento
