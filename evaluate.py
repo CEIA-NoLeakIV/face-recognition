@@ -1,16 +1,8 @@
 import os
 import numpy as np
 from PIL import Image
+from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_score, recall_score, f1_score, accuracy_score
 import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    roc_curve, 
-    auc, 
-    f1_score, 
-    precision_score, 
-    recall_score,
-    confusion_matrix,
-    ConfusionMatrixDisplay
-)
 
 import torch
 from torchvision import transforms
@@ -66,219 +58,173 @@ def extract_deep_features(model, image, device):
     return combined_features
 
 
-def k_fold_split(n=6000, n_folds=10):
+def compute_metrics_from_predictions(predictions, threshold=0.35):
     """
-    Creates k-fold splits for cross-validation.
+    Calcula métricas de classificação a partir das predições.
     
     Args:
-        n (int): Total number of samples
-        n_folds (int): Number of folds
+        predictions: Array com formato [path1, path2, similarity, ground_truth]
+        threshold: Limiar de similaridade para classificação
         
     Returns:
-        list: List of [train_indices, test_indices] for each fold
+        dict: Dicionário com precision, recall, f1, accuracy
     """
-    folds = []
-    base = list(range(n))
-    fold_size = n // n_folds
-
-    for idx in range(n_folds):
-        test = base[idx * fold_size:(idx + 1) * fold_size]
-        train = base[:idx * fold_size] + base[(idx + 1) * fold_size:]
-        folds.append([train, test])
-
-    return folds
-
-
-def eval_accuracy(predictions, threshold):
-    """
-    Calculates accuracy for binary classification.
+    if len(predictions) == 0:
+        return {
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'accuracy': 0.0
+        }
     
-    Args:
-        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
-        threshold (float): Threshold for classification
-        
-    Returns:
-        float: Accuracy score
-    """
-    y_true = []
-    y_pred = []
-
-    for _, _, distance, gt in predictions:
-        y_true.append(int(gt))
-        pred = 1 if float(distance) > threshold else 0
-        y_pred.append(pred)
-
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-
-    accuracy = np.mean(y_true == y_pred)
-    return accuracy
-
-
-def find_best_threshold(predictions, thresholds):
-    """
-    Finds the best threshold that maximizes accuracy.
+    # Extrair ground truth e predições
+    y_true = predictions[:, 3].astype(int)  # Ground truth (0 ou 1)
+    similarities = predictions[:, 2].astype(float)
+    y_pred = (similarities > threshold).astype(int)  # Predições baseadas no threshold
     
-    Args:
-        predictions (np.ndarray): Predictions array
-        thresholds (list): List of thresholds to test
-        
-    Returns:
-        float: Best threshold
-    """
-    best_accuracy = 0
-    best_threshold = 0
-
-    for threshold in thresholds:
-        accuracy = eval_accuracy(predictions, threshold)
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            best_threshold = threshold
-
-    return best_threshold
-
-
-def compute_roc_curve(predictions, save_path=None):
-    """
-    Computes ROC curve and AUC score.
-    
-    Args:
-        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
-        save_path (str, optional): Path to save ROC curve plot
-        
-    Returns:
-        dict: Dictionary containing fpr, tpr, auc_score, and roc_thresholds
-    """
-    # Extract ground truth and similarity scores
-    y_true = predictions[:, 3].astype(int)
-    y_scores = predictions[:, 2].astype(float)
-    
-    # Compute ROC curve
-    fpr, tpr, roc_thresholds = roc_curve(y_true, y_scores)
-    auc_score = auc(fpr, tpr)
-    
-    # Plot ROC curve if save_path is provided
-    if save_path:
-        plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, 
-                label=f'ROC curve (AUC = {auc_score:.4f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
-                label='Random Classifier')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Receiver Operating Characteristic (ROC) Curve')
-        plt.legend(loc="lower right")
-        plt.grid(alpha=0.3)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"ROC curve saved to: {save_path}")
+    # Calcular métricas
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    accuracy = accuracy_score(y_true, y_pred)
     
     return {
-        'fpr': fpr,
-        'tpr': tpr,
-        'auc_score': auc_score,
-        'roc_thresholds': roc_thresholds
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'accuracy': accuracy
     }
 
 
-def compute_f1_score(predictions, threshold):
+def compute_roc_metrics(predictions, save_path=None):
     """
-    Computes F1 score.
+    Calcula métricas ROC, TAR@FAR, e gera gráficos.
     
     Args:
-        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
-        threshold (float): Classification threshold
+        predictions: Array com formato [path1, path2, similarity, ground_truth]
+        save_path: Caminho para salvar os gráficos (opcional)
         
     Returns:
-        float: F1 score
+        dict: Dicionário com métricas ROC completas
     """
+    if len(predictions) == 0:
+        return None
+    
+    # Extrair ground truth e similaridades
     y_true = predictions[:, 3].astype(int)
-    y_scores = predictions[:, 2].astype(float)
-    y_pred = (y_scores > threshold).astype(int)
+    similarities = predictions[:, 2].astype(float)
     
-    f1 = f1_score(y_true, y_pred)
-    return f1
-
-
-def compute_precision(predictions, threshold):
-    """
-    Computes precision score.
+    # Calcular ROC curve
+    fpr, tpr, thresholds = roc_curve(y_true, similarities)
+    roc_auc = auc(fpr, tpr)
     
-    Args:
-        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
-        threshold (float): Classification threshold
-        
-    Returns:
-        float: Precision score
-    """
-    y_true = predictions[:, 3].astype(int)
-    y_scores = predictions[:, 2].astype(float)
-    y_pred = (y_scores > threshold).astype(int)
+    # Calcular EER (Equal Error Rate)
+    fnr = 1 - tpr
+    eer_threshold_idx = np.nanargmin(np.absolute((fnr - fpr)))
+    eer = fpr[eer_threshold_idx]
+    eer_threshold = thresholds[eer_threshold_idx]
     
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    return precision
-
-
-def compute_recall(predictions, threshold):
-    """
-    Computes recall score.
+    # Calcular TAR@FAR específicos
+    far_targets = [0.001, 0.01, 0.1]  # 0.1%, 1%, 10%
+    tar_at_far = {}
     
-    Args:
-        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
-        threshold (float): Classification threshold
-        
-    Returns:
-        float: Recall score
-    """
-    y_true = predictions[:, 3].astype(int)
-    y_scores = predictions[:, 2].astype(float)
-    y_pred = (y_scores > threshold).astype(int)
+    for far_target in far_targets:
+        idx = np.argmin(np.abs(fpr - far_target))
+        tar_at_far[f'TAR@FAR={far_target}'] = tpr[idx]
     
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    return recall
-
-
-def compute_confusion_matrix(predictions, threshold, save_path=None):
-    """
-    Computes and plots confusion matrix.
-    
-    Args:
-        predictions (np.ndarray): Array with columns [path1, path2, distance, gt]
-        threshold (float): Classification threshold
-        save_path (str, optional): Path to save confusion matrix plot
-        
-    Returns:
-        np.ndarray: Confusion matrix
-    """
-    y_true = predictions[:, 3].astype(int)
-    y_scores = predictions[:, 2].astype(float)
-    y_pred = (y_scores > threshold).astype(int)
-    
-    # Compute confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    
-    # Plot confusion matrix if save_path is provided
+    # Gerar gráfico ROC se save_path fornecido
     if save_path:
-        plt.figure(figsize=(8, 6))
-        disp = ConfusionMatrixDisplay(
-            confusion_matrix=cm,
-            display_labels=['Different', 'Same']
-        )
-        disp.plot(cmap='Blues', values_format='d')
-        plt.title('Confusion Matrix')
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        plt.figure(figsize=(10, 8))
+        plt.plot(fpr, tpr, color='darkorange', lw=2, 
+                label=f'ROC curve (AUC = {roc_auc:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
+        plt.scatter([fpr[eer_threshold_idx]], [tpr[eer_threshold_idx]], 
+                   color='red', s=100, label=f'EER = {eer:.4f}')
+        
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate (FAR)', fontsize=12)
+        plt.ylabel('True Positive Rate (TAR)', fontsize=12)
+        plt.title('Receiver Operating Characteristic (ROC) Curve', fontsize=14, fontweight='bold')
+        plt.legend(loc="lower right", fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Confusion matrix saved to: {save_path}")
+    
+    return {
+        'auc': roc_auc,
+        'eer': eer,
+        'eer_threshold': eer_threshold,
+        'fpr': fpr,
+        'tpr': tpr,
+        'thresholds': thresholds,
+        **tar_at_far
+    }
+
+
+def compute_confusion_matrix(predictions, threshold=0.35, save_path=None):
+    """
+    Calcula e visualiza matriz de confusão.
+    
+    Args:
+        predictions: Array com formato [path1, path2, similarity, ground_truth]
+        threshold: Limiar de similaridade
+        save_path: Caminho para salvar o gráfico (opcional)
+        
+    Returns:
+        np.ndarray: Matriz de confusão
+    """
+    if len(predictions) == 0:
+        return None
+    
+    # Extrair ground truth e predições
+    y_true = predictions[:, 3].astype(int)
+    similarities = predictions[:, 2].astype(float)
+    y_pred = (similarities > threshold).astype(int)
+    
+    # Calcular matriz de confusão
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Gerar visualização se save_path fornecido
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        plt.figure(figsize=(8, 6))
+        plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        plt.title('Confusion Matrix', fontsize=14, fontweight='bold')
+        plt.colorbar()
+        
+        classes = ['Different', 'Same']
+        tick_marks = np.arange(len(classes))
+        plt.xticks(tick_marks, classes, fontsize=12)
+        plt.yticks(tick_marks, classes, fontsize=12)
+        
+        # Adicionar valores na matriz
+        thresh = cm.max() / 2.
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(j, i, format(cm[i, j], 'd'),
+                        ha="center", va="center",
+                        color="white" if cm[i, j] > thresh else "black",
+                        fontsize=14, fontweight='bold')
+        
+        plt.ylabel('True label', fontsize=12)
+        plt.xlabel('Predicted label', fontsize=12)
+        plt.tight_layout()
+        
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
     
     return cm
 
 
 def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val', 
-         compute_metrics=True, save_plots=False, plots_dir='weights'):
+         compute_full_metrics=False, save_metrics_path=None, threshold=0.35):
     """
-    Evaluate the model on validation dataset (LFW or CelebA) with comprehensive metrics.
+    Evaluate the model on validation dataset (LFW or CelebA).
     
     Args:
         model: The model to evaluate
@@ -286,15 +232,12 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         device: Device to run evaluation on
         val_dataset: Dataset to use for validation ('lfw' or 'celeba')
         val_root: Root directory of validation data
-        compute_metrics: Whether to compute additional metrics (ROC, F1, etc.)
-        save_plots: Whether to save plots (ROC curve, confusion matrix)
-        plots_dir: Directory to save plots
+        compute_full_metrics: Se True, calcula métricas completas (ROC, confusion matrix, etc)
+        save_metrics_path: Diretório para salvar gráficos de métricas
+        threshold: Limiar de similaridade para métricas de classificação
         
     Returns:
-        tuple: (accuracy_proxy, predictions, metrics_dict)
-            - accuracy_proxy: Mean similarity score
-            - predictions: Array of predictions
-            - metrics_dict: Dictionary with all computed metrics
+        tuple: (mean_similarity, predictions, metrics_dict)
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -311,7 +254,9 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         ann_file = os.path.join(root, 'lfw_ann.txt')
         try:
             with open(ann_file) as f:
-                pair_lines = f.readlines()[1:]
+                lines = f.readlines()
+                # Primeira linha contém o número de pares, pular ela
+                pair_lines = lines[1:]
         except FileNotFoundError:
             print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'. Check the path.")
             return 0.0, np.array([]), {}
@@ -343,8 +288,18 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
                     path1 = os.path.join(root, person_name, filename1)
                     path2 = os.path.join(root, person_name, filename2)
                     is_same = '1'
+                elif len(parts) == 4:
+                    # Pares negativos: pessoa1 img1 pessoa2 img2
+                    person1, img_num1, person2, img_num2 = parts
+                    
+                    filename1 = f'{person1}_{int(img_num1):04d}.jpg'
+                    filename2 = f'{person2}_{int(img_num2):04d}.jpg'
+                    
+                    path1 = os.path.join(root, person1, filename1)
+                    path2 = os.path.join(root, person2, filename2)
+                    is_same = '0'
                 else:
-                    # Skip lines that don't have 3 columns
+                    # Skip lines that don't have 3 or 4 columns
                     continue
                     
             elif val_dataset == 'celeba':
@@ -381,92 +336,69 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
     mean_similarity = np.mean(similarities)
     std_similarity = np.std(similarities)
 
+    # Calcular métricas básicas
+    basic_metrics = compute_metrics_from_predictions(predicts, threshold=threshold)
+    
     dataset_name = val_dataset.upper()
-    print(f'{dataset_name} - Simplified Evaluation (Positive Pairs Only):')
-    print(f'Mean Similarity: {mean_similarity:.4f} | Standard Deviation: {std_similarity:.4f}')
-
-    # Initialize metrics dictionary
+    print(f'{dataset_name} Evaluation Results:')
+    print(f'Mean Similarity: {mean_similarity:.4f} | Std: {std_similarity:.4f}')
+    print(f'Precision: {basic_metrics["precision"]:.4f} | Recall: {basic_metrics["recall"]:.4f}')
+    print(f'F1-Score: {basic_metrics["f1"]:.4f} | Accuracy: {basic_metrics["accuracy"]:.4f}')
+    
     metrics_dict = {
         'mean_similarity': mean_similarity,
-        'std_similarity': std_similarity
+        'std_similarity': std_similarity,
+        **basic_metrics
     }
     
-    # Compute additional metrics if requested
-    if compute_metrics and len(predicts) > 0:
-        # Find best threshold
-        thresholds = np.linspace(0.2, 0.8, 100)
-        best_threshold = find_best_threshold(predicts, thresholds)
+    # Calcular métricas completas se solicitado
+    if compute_full_metrics and save_metrics_path:
+        # ROC e métricas relacionadas
+        roc_path = os.path.join(save_metrics_path, f'{val_dataset}_roc_curve.png')
+        roc_metrics = compute_roc_metrics(predicts, save_path=roc_path)
         
-        # Compute all metrics
-        accuracy = eval_accuracy(predicts, best_threshold)
-        f1 = compute_f1_score(predicts, best_threshold)
-        precision = compute_precision(predicts, best_threshold)
-        recall = compute_recall(predicts, best_threshold)
-        
-        # Add to metrics dictionary
-        metrics_dict.update({
-            'best_threshold': best_threshold,
-            'accuracy': accuracy,
-            'f1_score': f1,
-            'precision': precision,
-            'recall': recall
-        })
-        
-        # Compute ROC curve
-        if save_plots:
-            os.makedirs(plots_dir, exist_ok=True)
-            roc_save_path = os.path.join(plots_dir, f'{val_dataset}_roc_curve.png')
-            cm_save_path = os.path.join(plots_dir, f'{val_dataset}_confusion_matrix.png')
-        else:
-            roc_save_path = None
-            cm_save_path = None
+        if roc_metrics:
+            print(f'\nROC Metrics:')
+            print(f'AUC: {roc_metrics["auc"]:.4f}')
+            print(f'EER: {roc_metrics["eer"]:.4f} (threshold: {roc_metrics["eer_threshold"]:.4f})')
+            for key, value in roc_metrics.items():
+                if key.startswith('TAR@FAR'):
+                    print(f'{key}: {value:.4f}')
             
-        roc_results = compute_roc_curve(predicts, save_path=roc_save_path)
-        cm = compute_confusion_matrix(predicts, best_threshold, save_path=cm_save_path)
+            metrics_dict.update(roc_metrics)
         
-        # Add ROC results to metrics
-        metrics_dict.update({
-            'auc_score': roc_results['auc_score'],
-            'confusion_matrix': cm
-        })
+        # Matriz de confusão
+        cm_path = os.path.join(save_metrics_path, f'{val_dataset}_confusion_matrix.png')
+        cm = compute_confusion_matrix(predicts, threshold=threshold, save_path=cm_path)
         
-        # Print metrics
-        print(f'\nAdditional Metrics (Threshold: {best_threshold:.4f}):')
-        print(f'  Accuracy:  {accuracy:.4f}')
-        print(f'  F1 Score:  {f1:.4f}')
-        print(f'  Precision: {precision:.4f}')
-        print(f'  Recall:    {recall:.4f}')
-        print(f'  AUC Score: {roc_results["auc_score"]:.4f}')
-        print(f'\nConfusion Matrix:')
-        print(f'  TN: {cm[0,0]:5d}  FP: {cm[0,1]:5d}')
-        print(f'  FN: {cm[1,0]:5d}  TP: {cm[1,1]:5d}')
-
-    accuracy_proxy = mean_similarity 
+        if cm is not None:
+            tn, fp, fn, tp = cm.ravel()
+            far = fp / (fp + tn) if (fp + tn) > 0 else 0
+            frr = fn / (fn + tp) if (fn + tp) > 0 else 0
+            
+            print(f'\nConfusion Matrix:')
+            print(f'True Negatives: {tn}, False Positives: {fp}')
+            print(f'False Negatives: {fn}, True Positives: {tp}')
+            print(f'FAR (False Accept Rate): {far:.4f}')
+            print(f'FRR (False Reject Rate): {frr:.4f}')
+            
+            metrics_dict.update({
+                'confusion_matrix': cm,
+                'true_negatives': int(tn),
+                'false_positives': int(fp),
+                'false_negatives': int(fn),
+                'true_positives': int(tp),
+                'far': far,
+                'frr': frr
+            })
     
-    return accuracy_proxy, predicts, metrics_dict
+    return mean_similarity, predicts, metrics_dict
 
 
 if __name__ == '__main__':
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    models_to_test = [
-        (sphere20(512), 'weights/sphere20_mcp.pth'),
-        (sphere36(512), 'weights/sphere36_mcp.pth'),
-        (MobileNetV1(512), 'weights/mobilenetv1_mcp.pth'),
-        (MobileNetV2(512), 'weights/mobilenetv2_mcp.pth'),
-        (mobilenet_v3_small(512), 'weights/mobilenetv3_small_mcp.pth'),
-        (mobilenet_v3_large(512), 'weights/mobilenetv3_large_mcp.pth')
-    ]
-    
-    for model, model_path in models_to_test:
-        print(f"\n{'='*70}")
-        print(f"Evaluating: {model_path}")
-        print(f"{'='*70}")
-        _, _, metrics = eval(
-            model.to(device), 
-            model_path=model_path,
-            compute_metrics=True,
-            save_plots=True,
-            plots_dir='weights'
-        )
+    _, result, _ = eval(sphere20(512).to('cuda'), model_path='weights/sphere20_mcp.pth')
+    _, result, _ = eval(sphere36(512).to('cuda'), model_path='weights/sphere36_mcp.pth')
+    _, result, _ = eval(MobileNetV1(512).to('cuda'), model_path='weights/mobilenetv1_mcp.pth')
+    _, result, _ = eval(MobileNetV2(512).to('cuda'), model_path='weights/mobilenetv2_mcp.pth')
+    _, result, _ = eval(mobilenet_v3_small(512).to('cuda'), model_path='weights/mobilenetv3_small_mcp.pth')
+    _, result, _ = eval(mobilenet_v3_large(512).to('cuda'), model_path='weights/mobilenetv3_large_mcp.pth')

@@ -19,7 +19,6 @@ from utils.general import (
     EarlyStopping,
     LOGGER,
 )
-from utils.training_tracker import TrainingTracker
 
 from models import (
     sphere20,
@@ -133,6 +132,12 @@ def parse_arguments():
         default='data/lfw/val',
         help='Path to validation dataset root directory. Default: data/lfw/val.'
     )
+    parser.add_argument(
+        '--val-threshold',
+        type=float,
+        default=0.35,
+        help='Similarity threshold for validation metrics. Default: 0.35.'
+    )
 
     parser.add_argument("--world-size", default=1, type=int, help="Number of distributed processes")
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
@@ -144,7 +149,6 @@ def parse_arguments():
     )
 
     return parser.parse_args()
-
 
 def validate_model(model, classification_head, val_loader, device):
     """Validates the model on validation subset"""
@@ -200,8 +204,7 @@ def train_one_epoch(
     device,
     epoch,
     params
-):
-    """Training loop for one epoch - returns average loss and accuracy"""
+) -> None:
     model.train()
     losses = AverageMeter("Avg Loss", ":6.3f")
     batch_time = AverageMeter("Batch Time", ":4.3f")
@@ -209,8 +212,6 @@ def train_one_epoch(
     last_batch_idx = len(data_loader) - 1
 
     start_time = time.time()
-    epoch_start_time = time.time()
-    
     for batch_idx, (images, target) in enumerate(data_loader):
         last_batch = last_batch_idx == batch_idx
 
@@ -271,19 +272,14 @@ def train_one_epoch(
             )
             LOGGER.info(log)
 
-    # Calculate total epoch time
-    epoch_time = time.time() - epoch_start_time
-
     # End-of-epoch summary
     log = (
         f'Epoch [{epoch}/{params.epochs}] Summary: '
         f'Loss: {losses.avg:6.3f}, '
         f'Accuracy: {accuracy_meter.avg:4.2f}%, '
-        f'Total Time: {epoch_time:4.1f}s'
+        f'Total Time: {batch_time.sum:4.3f}s'
     )
     LOGGER.info(log)
-    
-    return losses.avg, accuracy_meter.avg / 100.0, epoch_time  # Return as fraction
 
 
 def main(params):
@@ -346,6 +342,10 @@ def main(params):
 
     # Create save path if it does not exist
     os.makedirs(params.save_path, exist_ok=True)
+    
+    # Create metrics save path
+    metrics_save_path = os.path.join(params.save_path, 'metrics')
+    os.makedirs(metrics_save_path, exist_ok=True)
 
     # Select classification head
     classification_head = get_classification_head(params.classifier, embedding_dim=512, num_classes=num_classes)
@@ -411,21 +411,7 @@ def main(params):
     else:
         raise ValueError(f"Unsupported lr_scheduler type: {params.lr_scheduler}")
 
-    # ============ INITIALIZE TRAINING TRACKER ============
-    experiment_name = f"{params.network}_{params.classifier}_{params.database}"
-    tracker = TrainingTracker(
-        save_dir=params.save_path,
-        experiment_name=experiment_name
-    )
-    LOGGER.info(f"📊 Training Tracker initialized: {experiment_name}")
-    
     start_epoch = 0
-    best_metrics = {
-        'similarity': 0.0,
-        'auc': 0.0,
-        'f1': 0.0
-    }
-    
     if params.checkpoint and os.path.isfile(params.checkpoint):
         ckpt = torch.load(params.checkpoint, map_location="cpu")
 
@@ -440,17 +426,10 @@ def main(params):
                     state[k] = v.to(device)
 
         start_epoch = ckpt['epoch']
-        if 'best_metrics' in ckpt:
-            best_metrics = ckpt['best_metrics']
-        
-        # Restore training history if available
-        if 'training_history' in ckpt:
-            tracker.history = ckpt['training_history']
-            LOGGER.info(f"📊 Restored training history from checkpoint")
-            
         LOGGER.info(f'Resumed training from {params.checkpoint}, starting at epoch {start_epoch}')
 
-    curr_metrics = {}
+    best_accuracy = 0.0
+    curr_accuracy = 0.0
     early_stopping = EarlyStopping(patience=10)
 
     # Training loop
@@ -458,9 +437,7 @@ def main(params):
     for epoch in range(start_epoch, params.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        
-        # Train one epoch and get metrics
-        train_loss, train_accuracy, epoch_time = train_one_epoch(
+        train_one_epoch(
             model,
             classification_head,
             criterion,
@@ -470,124 +447,141 @@ def main(params):
             epoch,
             params
         )
-        
-        # Get current learning rate
-        current_lr = optimizer.param_groups[0]['lr']
-        
         lr_scheduler.step()
 
         base_filename = f'{params.network}_{params.classifier}'
+
         last_save_path = os.path.join(params.save_path, f'{base_filename}_last.ckpt')
 
-        # Internal validation
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=params.batch_size,
-            shuffle=False,
-            num_workers=params.num_workers,
-            pin_memory=True
-        )
-        val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
-
-        if params.local_rank == 0:
-            # External validation with all metrics and plots
-            LOGGER.info(f'\n{"="*70}')
-            LOGGER.info(f'External Validation - Epoch {epoch + 1}')
-            LOGGER.info(f'{"="*70}')
-            
-            # Create epoch-specific directory for plots
-            epoch_plots_dir = os.path.join(params.save_path, f'epoch_{epoch+1:03d}')
-            
-            curr_similarity, _, curr_metrics = evaluate.eval(
-                model_without_ddp, 
-                device=device,
-                val_dataset=params.val_dataset,
-                val_root=params.val_root,
-                compute_metrics=True,
-                save_plots=True,  # Always save plots
-                plots_dir=epoch_plots_dir
-            )
-            
-            # Log metrics to tracker
-            tracker.log_epoch(
-                epoch=epoch + 1,
-                train_loss=train_loss,
-                train_accuracy=train_accuracy,
-                val_accuracy=val_accuracy,
-                external_metrics=curr_metrics,
-                learning_rate=current_lr,
-                epoch_time=epoch_time
-            )
-            
-            # Log all metrics
-            LOGGER.info(f'\nInternal Validation ({params.database} subset): {val_accuracy:.4f}')
-            LOGGER.info(f'\nExternal Validation Metrics ({params.val_dataset.upper()}):')
-            LOGGER.info(f'  Mean Similarity: {curr_metrics["mean_similarity"]:.4f}')
-            LOGGER.info(f'  Best Threshold:  {curr_metrics.get("best_threshold", 0.35):.4f}')
-            LOGGER.info(f'  Accuracy:        {curr_metrics.get("accuracy", 0.0):.4f}')
-            LOGGER.info(f'  F1 Score:        {curr_metrics.get("f1_score", 0.0):.4f}')
-            LOGGER.info(f'  Precision:       {curr_metrics.get("precision", 0.0):.4f}')
-            LOGGER.info(f'  Recall:          {curr_metrics.get("recall", 0.0):.4f}')
-            LOGGER.info(f'  AUC Score:       {curr_metrics.get("auc_score", 0.0):.4f}')
-            LOGGER.info(f'{"="*70}\n')
-
-        # Save checkpoint with training history
+        # Save the last checkpoint
         checkpoint = {
             'epoch': epoch + 1,
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
             'lr_scheduler': lr_scheduler.state_dict(),
-            'best_metrics': best_metrics,
-            'training_history': tracker.history,  # Include history
             'args': params
         }
-        
+
         save_on_master(checkpoint, last_save_path)
 
-        if early_stopping(epoch, curr_similarity):
+        if params.local_rank == 0:
+            # Validation Evaluation with metrics
+            LOGGER.info(f'\n{"="*70}')
+            LOGGER.info(f'EPOCH {epoch+1} VALIDATION METRICS')
+            LOGGER.info(f'{"="*70}')
+            
+            # Salvar métricas por época
+            epoch_metrics_path = os.path.join(metrics_save_path, f'epoch_{epoch+1}')
+            os.makedirs(epoch_metrics_path, exist_ok=True)
+            
+            curr_accuracy, _, metrics = evaluate.eval(
+                model_without_ddp, 
+                device=device,
+                val_dataset=params.val_dataset,
+                val_root=params.val_root,
+                compute_full_metrics=True,
+                save_metrics_path=epoch_metrics_path,
+                threshold=params.val_threshold
+            )
+            
+            # Log das métricas principais
+            LOGGER.info(f'\nValidation Metrics (Threshold={params.val_threshold}):')
+            LOGGER.info(f'  Precision: {metrics["precision"]:.4f}')
+            LOGGER.info(f'  Recall:    {metrics["recall"]:.4f}')
+            LOGGER.info(f'  F1-Score:  {metrics["f1"]:.4f}')
+            LOGGER.info(f'  Accuracy:  {metrics["accuracy"]:.4f}')
+            
+            if 'auc' in metrics:
+                LOGGER.info(f'\nROC Metrics:')
+                LOGGER.info(f'  AUC: {metrics["auc"]:.4f}')
+                LOGGER.info(f'  EER: {metrics["eer"]:.4f}')
+            
+            if 'far' in metrics and 'frr' in metrics:
+                LOGGER.info(f'\nError Rates:')
+                LOGGER.info(f'  FAR (False Accept Rate):  {metrics["far"]:.4f}')
+                LOGGER.info(f'  FRR (False Reject Rate):  {metrics["frr"]:.4f}')
+            
+            LOGGER.info(f'{"="*70}\n')
+            
+            # Internal validation (for monitoring only)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=params.batch_size,
+                shuffle=False,
+                num_workers=params.num_workers,
+                pin_memory=True
+            )
+            
+            val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
+            LOGGER.info(f'Internal validation accuracy ({params.database} subset): {val_accuracy:.4f}\n')
+
+        if early_stopping(epoch, curr_accuracy):
             break
 
-        # Save best model based on multiple criteria
-        is_best = False
-        best_type = ''
-        
-        # Check if any metric improved
-        if curr_similarity > best_metrics['similarity']:
-            best_metrics['similarity'] = curr_similarity
-            is_best = True
-            best_type = 'similarity'
-            
-        if curr_metrics.get('auc_score', 0.0) > best_metrics['auc']:
-            best_metrics['auc'] = curr_metrics['auc_score']
-            is_best = True
-            best_type = 'auc'
-            
-        if curr_metrics.get('f1_score', 0.0) > best_metrics['f1']:
-            best_metrics['f1'] = curr_metrics['f1_score']
-            is_best = True
-            best_type = 'f1'
-        
-        if is_best:
-            checkpoint['best_metrics'] = best_metrics
+        # Save the best model if validation similarity improves
+        if curr_accuracy > best_accuracy:
+            best_accuracy = curr_accuracy
             save_on_master(checkpoint, os.path.join(params.save_path, f'{base_filename}_best.ckpt'))
             LOGGER.info(
-                f"New best {best_type.upper()}: {best_metrics[best_type]:.4f}. "
-                f"Model saved to {params.save_path} with `_best` postfix."
+                f"New best {params.val_dataset.upper()} similarity: {best_accuracy:.4f}. "
+                f"Model saved to {params.save_path} with `_best` postfix.\n"
             )
 
-    # ============ GENERATE FINAL REPORT ============
+    # Final comprehensive evaluation after training
     if params.local_rank == 0:
-        LOGGER.info('\n' + '='*70)
-        LOGGER.info('TRAINING COMPLETED - GENERATING FINAL REPORT')
-        LOGGER.info('='*70 + '\n')
+        LOGGER.info(f'\n{"="*70}')
+        LOGGER.info('FINAL COMPREHENSIVE EVALUATION')
+        LOGGER.info(f'{"="*70}')
         
-        report_dir = tracker.generate_final_report()
+        # Criar diretório para métricas finais
+        final_metrics_path = os.path.join(metrics_save_path, 'final_evaluation')
+        os.makedirs(final_metrics_path, exist_ok=True)
         
-        LOGGER.info('\nBest Metrics Achieved:')
-        LOGGER.info(f'  Similarity: {best_metrics["similarity"]:.4f}')
-        LOGGER.info(f'  AUC:        {best_metrics["auc"]:.4f}')
-        LOGGER.info(f'  F1 Score:   {best_metrics["f1"]:.4f}')
-        LOGGER.info(f'\n📁 Final report saved to: {report_dir}')
+        # Avaliar com todas as métricas
+        _, _, final_metrics = evaluate.eval(
+            model_without_ddp,
+            device=device,
+            val_dataset=params.val_dataset,
+            val_root=params.val_root,
+            compute_full_metrics=True,
+            save_metrics_path=final_metrics_path,
+            threshold=params.val_threshold
+        )
+        
+        LOGGER.info(f'\nFinal Validation Metrics:')
+        LOGGER.info(f'  Mean Similarity: {final_metrics["mean_similarity"]:.4f} ± {final_metrics["std_similarity"]:.4f}')
+        LOGGER.info(f'  Precision:       {final_metrics["precision"]:.4f}')
+        LOGGER.info(f'  Recall:          {final_metrics["recall"]:.4f}')
+        LOGGER.info(f'  F1-Score:        {final_metrics["f1"]:.4f}')
+        LOGGER.info(f'  Accuracy:        {final_metrics["accuracy"]:.4f}')
+        
+        if 'auc' in final_metrics:
+            LOGGER.info(f'\nROC Analysis:')
+            LOGGER.info(f'  AUC:             {final_metrics["auc"]:.4f}')
+            LOGGER.info(f'  EER:             {final_metrics["eer"]:.4f} (threshold: {final_metrics["eer_threshold"]:.4f})')
+            
+            # TAR@FAR metrics
+            for key in final_metrics:
+                if key.startswith('TAR@FAR'):
+                    far_value = key.split('=')[1]
+                    LOGGER.info(f'  TAR@FAR={far_value}: {final_metrics[key]:.4f}')
+        
+        if 'confusion_matrix' in final_metrics:
+            LOGGER.info(f'\nConfusion Matrix:')
+            LOGGER.info(f'  True Negatives:  {final_metrics["true_negatives"]}')
+            LOGGER.info(f'  False Positives: {final_metrics["false_positives"]}')
+            LOGGER.info(f'  False Negatives: {final_metrics["false_negatives"]}')
+            LOGGER.info(f'  True Positives:  {final_metrics["true_positives"]}')
+            LOGGER.info(f'\n  FAR (False Accept Rate): {final_metrics["far"]:.4f}')
+            LOGGER.info(f'  FRR (False Reject Rate): {final_metrics["frr"]:.4f}')
+        
+        LOGGER.info(f'\n{"="*70}')
+        LOGGER.info(f'Metrics saved to: {final_metrics_path}')
+        LOGGER.info(f'  - ROC Curve: {params.val_dataset}_roc_curve.png')
+        LOGGER.info(f'  - Confusion Matrix: {params.val_dataset}_confusion_matrix.png')
+        LOGGER.info(f'{"="*70}\n')
+
+    LOGGER.info('Training completed.')
 
 
 if __name__ == '__main__':
