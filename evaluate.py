@@ -17,6 +17,13 @@ from models import (
     mobilenet_v3_large,
 )
 
+# Import face validation (optional)
+try:
+    from utils.face_validation import FaceValidator, validate_lfw_pairs
+    FACE_VALIDATION_AVAILABLE = True
+except ImportError:
+    FACE_VALIDATION_AVAILABLE = False
+
 
 def extract_deep_features(model, image, device):
     """
@@ -67,107 +74,126 @@ def compute_metrics_from_predictions(predictions, threshold=0.35):
         threshold: Limiar de similaridade para classificação
         
     Returns:
-        dict: Dicionário com precision, recall, f1, accuracy
+        dict: Dicionário com todas as métricas calculadas
     """
     if len(predictions) == 0:
-        return {
-            'precision': 0.0,
-            'recall': 0.0,
-            'f1': 0.0,
-            'accuracy': 0.0
-        }
-    
-    # Extrair ground truth e predições
-    y_true = predictions[:, 3].astype(int)  # Ground truth (0 ou 1)
-    similarities = predictions[:, 2].astype(float)
-    y_pred = (similarities > threshold).astype(int)  # Predições baseadas no threshold
-    
-    # Calcular métricas
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    accuracy = accuracy_score(y_true, y_pred)
-    
-    return {
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'accuracy': accuracy
-    }
-
-
-def compute_roc_metrics(predictions, save_path=None):
-    """
-    Calcula métricas ROC, TAR@FAR, e gera gráficos.
-    
-    Args:
-        predictions: Array com formato [path1, path2, similarity, ground_truth]
-        save_path: Caminho para salvar os gráficos (opcional)
-        
-    Returns:
-        dict: Dicionário com métricas ROC completas
-    """
-    if len(predictions) == 0:
-        return None
+        return {}
     
     # Extrair ground truth e similaridades
     y_true = predictions[:, 3].astype(int)
     similarities = predictions[:, 2].astype(float)
     
-    # Calcular ROC curve
-    fpr, tpr, thresholds = roc_curve(y_true, similarities)
+    # Predições binárias baseadas no threshold
+    y_pred = (similarities > threshold).astype(int)
+    
+    # Calcular métricas básicas
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    accuracy = accuracy_score(y_true, y_pred)
+    
+    # Calcular matriz de confusão
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+    
+    # Calcular taxas de erro
+    far = fp / (fp + tn) if (fp + tn) > 0 else 0  # False Accept Rate
+    frr = fn / (fn + tp) if (fn + tp) > 0 else 0  # False Reject Rate
+    
+    metrics = {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'accuracy': accuracy,
+        'confusion_matrix': cm,
+        'true_negatives': int(tn),
+        'false_positives': int(fp),
+        'false_negatives': int(fn),
+        'true_positives': int(tp),
+        'far': far,
+        'frr': frr
+    }
+    
+    # Calcular ROC e AUC se houver ambas as classes
+    if len(np.unique(y_true)) > 1:
+        fpr, tpr, thresholds = roc_curve(y_true, similarities)
+        roc_auc = auc(fpr, tpr)
+        
+        # Calcular EER (Equal Error Rate)
+        fnr = 1 - tpr
+        eer_threshold_idx = np.nanargmin(np.absolute((fnr - fpr)))
+        eer = fpr[eer_threshold_idx]
+        eer_threshold = thresholds[eer_threshold_idx]
+        
+        # Calcular TAR@FAR
+        tar_at_far = {}
+        for far_value in [0.001, 0.01, 0.1]:
+            idx = np.where(fpr <= far_value)[0]
+            if len(idx) > 0:
+                tar_at_far[f'TAR@FAR={far_value}'] = tpr[idx[-1]]
+        
+        metrics.update({
+            'fpr': fpr,
+            'tpr': tpr,
+            'thresholds': thresholds,
+            'auc': roc_auc,
+            'eer': eer,
+            'eer_threshold': eer_threshold,
+            **tar_at_far
+        })
+    
+    return metrics
+
+
+def plot_roc_curve(predictions, save_path=None):
+    """
+    Plota e salva a curva ROC.
+    
+    Args:
+        predictions: Array com formato [path1, path2, similarity, ground_truth]
+        save_path: Caminho para salvar o gráfico
+        
+    Returns:
+        tuple: (fpr, tpr, auc_score)
+    """
+    if len(predictions) == 0:
+        return None, None, None
+    
+    y_true = predictions[:, 3].astype(int)
+    similarities = predictions[:, 2].astype(float)
+    
+    # Verificar se há ambas as classes
+    if len(np.unique(y_true)) < 2:
+        print("Warning: Cannot compute ROC curve - only one class present in ground truth")
+        return None, None, None
+    
+    fpr, tpr, _ = roc_curve(y_true, similarities)
     roc_auc = auc(fpr, tpr)
     
-    # Calcular EER (Equal Error Rate)
-    fnr = 1 - tpr
-    eer_threshold_idx = np.nanargmin(np.absolute((fnr - fpr)))
-    eer = fpr[eer_threshold_idx]
-    eer_threshold = thresholds[eer_threshold_idx]
-    
-    # Calcular TAR@FAR específicos
-    far_targets = [0.001, 0.01, 0.1]  # 0.1%, 1%, 10%
-    tar_at_far = {}
-    
-    for far_target in far_targets:
-        idx = np.argmin(np.abs(fpr - far_target))
-        tar_at_far[f'TAR@FAR={far_target}'] = tpr[idx]
-    
-    # Gerar gráfico ROC se save_path fornecido
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        plt.figure(figsize=(10, 8))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, 
-                label=f'ROC curve (AUC = {roc_auc:.4f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
-        plt.scatter([fpr[eer_threshold_idx]], [tpr[eer_threshold_idx]], 
-                   color='red', s=100, label=f'EER = {eer:.4f}')
-        
+        plt.figure(figsize=(8, 6))
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate (FAR)', fontsize=12)
-        plt.ylabel('True Positive Rate (TAR)', fontsize=12)
-        plt.title('Receiver Operating Characteristic (ROC) Curve', fontsize=14, fontweight='bold')
+        plt.xlabel('False Positive Rate', fontsize=12)
+        plt.ylabel('True Positive Rate', fontsize=12)
+        plt.title('ROC Curve', fontsize=14, fontweight='bold')
         plt.legend(loc="lower right", fontsize=10)
-        plt.grid(True, alpha=0.3)
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
         
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
     
-    return {
-        'auc': roc_auc,
-        'eer': eer,
-        'eer_threshold': eer_threshold,
-        'fpr': fpr,
-        'tpr': tpr,
-        'thresholds': thresholds,
-        **tar_at_far
-    }
+    return fpr, tpr, roc_auc
 
 
-def compute_confusion_matrix(predictions, threshold=0.35, save_path=None):
+def plot_confusion_matrix(predictions, threshold, save_path=None):
     """
-    Calcula e visualiza matriz de confusão.
+    Plota e salva a matriz de confusão.
     
     Args:
         predictions: Array com formato [path1, path2, similarity, ground_truth]
@@ -222,9 +248,10 @@ def compute_confusion_matrix(predictions, threshold=0.35, save_path=None):
 
 
 def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val', 
-         compute_full_metrics=False, save_metrics_path=None, threshold=0.35):
+         compute_full_metrics=False, save_metrics_path=None, threshold=0.35,
+         face_validator=None, no_face_policy='exclude'):
     """
-    Evaluate the model on validation dataset (LFW or CelebA).
+    Evaluate the model on validation dataset (LFW or CelebA)
     
     Args:
         model: The model to evaluate
@@ -235,6 +262,8 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         compute_full_metrics: Se True, calcula métricas completas (ROC, confusion matrix, etc)
         save_metrics_path: Diretório para salvar gráficos de métricas
         threshold: Limiar de similaridade para métricas de classificação
+        face_validator: 🆕 FaceValidator instance for RetinaFace validation (optional)
+        no_face_policy: 🆕 Policy for images without faces ('exclude' or 'include')
         
     Returns:
         tuple: (mean_similarity, predictions, metrics_dict)
@@ -271,8 +300,58 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
     else:
         raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw' or 'celeba'.")
 
+    # 🆕 FACE VALIDATION: Validate and filter pairs if face_validator is provided
+    valid_pairs_list = None
+    face_validation_stats = {}
+    
+    if face_validator is not None and FACE_VALIDATION_AVAILABLE:
+        print(f"\n{'='*70}")
+        print("🔍 VALIDATING FACES WITH RETINAFACE")
+        print(f"{'='*70}")
+        
+        if val_dataset == 'lfw':
+            valid_pairs_tuples, excluded_pairs, pair_stats = validate_lfw_pairs(
+                face_validator,
+                lfw_root=root,
+                ann_file=ann_file,
+                policy=no_face_policy
+            )
+            
+            # Convert tuples to pair_lines format
+            valid_pairs_list = []
+            for path1, path2, is_same in valid_pairs_tuples:
+                valid_pairs_list.append((path1, path2, is_same))
+            
+            # Store statistics
+            face_validation_stats = pair_stats
+            
+            print(f"\nFace Validation Results:")
+            print(f"  Total pairs:        {pair_stats['total_pairs']}")
+            print(f"  Valid pairs:        {pair_stats['valid_pairs']}")
+            print(f"  Excluded pairs:     {pair_stats['excluded_pairs']} ({pair_stats['exclusion_rate']:.2f}%)")
+            print(f"  Policy:             {no_face_policy.upper()}")
+            
+            if pair_stats['excluded_pairs'] > 0:
+                print(f"\n⚠️  WARNING: {pair_stats['excluded_pairs']} pairs were excluded due to missing face detection")
+            
+            print(f"{'='*70}\n")
+        
+        elif val_dataset == 'celeba':
+            # Similar implementation for CelebA (not fully implemented here)
+            print("Warning: Face validation for CelebA not fully implemented yet")
+            valid_pairs_list = None
+
+    # Process pairs
     predicts = []
-    with torch.no_grad():
+    pairs_to_process = []
+    
+    # 🆕 If face validation was performed and pairs were filtered
+    if valid_pairs_list is not None:
+        # Use filtered pairs
+        for path1, path2, is_same in valid_pairs_list:
+            pairs_to_process.append((path1, path2, is_same))
+    else:
+        # Use all pairs from annotation file (original behavior)
         for line in pair_lines:
             parts = line.strip().split()
 
@@ -313,7 +392,12 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
                     is_same = '1'
                 else:
                     continue
-
+            
+            pairs_to_process.append((path1, path2, is_same))
+    
+    # Extract features for all pairs
+    with torch.no_grad():
+        for path1, path2, is_same in pairs_to_process:
             try:
                 img1 = Image.open(path1).convert('RGB')
                 img2 = Image.open(path2).convert('RGB')
@@ -331,74 +415,93 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         print("Warning: No valid pairs were processed in the evaluation.")
         return 0.0, np.array([]), {}
 
+    # Convert to numpy array
     predicts = np.array(predicts)
+    
+    # Calculate mean similarity
     similarities = predicts[:, 2].astype(float)
     mean_similarity = np.mean(similarities)
     std_similarity = np.std(similarities)
-
-    # Calcular métricas básicas
-    basic_metrics = compute_metrics_from_predictions(predicts, threshold=threshold)
     
-    dataset_name = val_dataset.upper()
-    print(f'{dataset_name} Evaluation Results:')
-    print(f'Mean Similarity: {mean_similarity:.4f} | Std: {std_similarity:.4f}')
-    print(f'Precision: {basic_metrics["precision"]:.4f} | Recall: {basic_metrics["recall"]:.4f}')
-    print(f'F1-Score: {basic_metrics["f1"]:.4f} | Accuracy: {basic_metrics["accuracy"]:.4f}')
-    
-    metrics_dict = {
+    # Initialize metrics dictionary
+    metrics = {
         'mean_similarity': mean_similarity,
         'std_similarity': std_similarity,
-        **basic_metrics
+        'min_similarity': np.min(similarities),
+        'max_similarity': np.max(similarities),
+        'median_similarity': np.median(similarities),
     }
     
-    # Calcular métricas completas se solicitado
-    if compute_full_metrics and save_metrics_path:
-        # ROC e métricas relacionadas
-        roc_path = os.path.join(save_metrics_path, f'{val_dataset}_roc_curve.png')
-        roc_metrics = compute_roc_metrics(predicts, save_path=roc_path)
-        
-        if roc_metrics:
-            print(f'\nROC Metrics:')
-            print(f'AUC: {roc_metrics["auc"]:.4f}')
-            print(f'EER: {roc_metrics["eer"]:.4f} (threshold: {roc_metrics["eer_threshold"]:.4f})')
-            for key, value in roc_metrics.items():
-                if key.startswith('TAR@FAR'):
-                    print(f'{key}: {value:.4f}')
-            
-            metrics_dict.update(roc_metrics)
-        
-        # Matriz de confusão
-        cm_path = os.path.join(save_metrics_path, f'{val_dataset}_confusion_matrix.png')
-        cm = compute_confusion_matrix(predicts, threshold=threshold, save_path=cm_path)
-        
-        if cm is not None:
-            tn, fp, fn, tp = cm.ravel()
-            far = fp / (fp + tn) if (fp + tn) > 0 else 0
-            frr = fn / (fn + tp) if (fn + tp) > 0 else 0
-            
-            print(f'\nConfusion Matrix:')
-            print(f'True Negatives: {tn}, False Positives: {fp}')
-            print(f'False Negatives: {fn}, True Positives: {tp}')
-            print(f'FAR (False Accept Rate): {far:.4f}')
-            print(f'FRR (False Reject Rate): {frr:.4f}')
-            
-            metrics_dict.update({
-                'confusion_matrix': cm,
-                'true_negatives': int(tn),
-                'false_positives': int(fp),
-                'false_negatives': int(fn),
-                'true_positives': int(tp),
-                'far': far,
-                'frr': frr
-            })
+    # 🆕 Add face validation statistics to metrics if available
+    if face_validation_stats:
+        metrics['face_validation_stats'] = face_validation_stats
     
-    return mean_similarity, predicts, metrics_dict
+    # Compute full metrics if requested
+    if compute_full_metrics:
+        classification_metrics = compute_metrics_from_predictions(predicts, threshold)
+        metrics.update(classification_metrics)
+        
+        # Save visualizations if path provided
+        if save_metrics_path:
+            os.makedirs(save_metrics_path, exist_ok=True)
+            
+            # ROC Curve
+            roc_path = os.path.join(save_metrics_path, f'{val_dataset}_roc_curve.png')
+            plot_roc_curve(predicts, save_path=roc_path)
+            
+            # Confusion Matrix
+            cm_path = os.path.join(save_metrics_path, f'{val_dataset}_confusion_matrix.png')
+            plot_confusion_matrix(predicts, threshold, save_path=cm_path)
+    
+    # Print summary
+    print(f"\n{'='*50}")
+    print(f"{val_dataset.upper()} - Simplified Evaluation (Positive Pairs Only):")
+    print(f"Mean Similarity: {mean_similarity:.4f} | Standard Deviation: {std_similarity:.4f}")
+    
+    if compute_full_metrics and 'accuracy' in metrics:
+        print(f"\nAdditional Metrics (Threshold: {threshold:.4f}):")
+        print(f"  Accuracy:  {metrics['accuracy']:.4f}")
+        print(f"  F1 Score:  {metrics['f1']:.4f}")
+        print(f"  Precision: {metrics['precision']:.4f}")
+        print(f"  Recall:    {metrics['recall']:.4f}")
+        if 'auc' in metrics:
+            print(f"  AUC Score: {metrics['auc']:.4f}")
+        
+        if 'confusion_matrix' in metrics:
+            cm = metrics['confusion_matrix']
+            print(f"\nConfusion Matrix:")
+            print(f"  TN: {metrics['true_negatives']:5d}  FP: {metrics['false_positives']:5d}")
+            print(f"  FN: {metrics['false_negatives']:5d}  TP: {metrics['true_positives']:5d}")
+    
+    print(f"{'='*50}\n")
+    
+    return mean_similarity, predicts, metrics
 
 
 if __name__ == '__main__':
-    _, result, _ = eval(sphere20(512).to('cuda'), model_path='weights/sphere20_mcp.pth')
-    _, result, _ = eval(sphere36(512).to('cuda'), model_path='weights/sphere36_mcp.pth')
-    _, result, _ = eval(MobileNetV1(512).to('cuda'), model_path='weights/mobilenetv1_mcp.pth')
-    _, result, _ = eval(MobileNetV2(512).to('cuda'), model_path='weights/mobilenetv2_mcp.pth')
-    _, result, _ = eval(mobilenet_v3_small(512).to('cuda'), model_path='weights/mobilenetv3_small_mcp.pth')
-    _, result, _ = eval(mobilenet_v3_large(512).to('cuda'), model_path='weights/mobilenetv3_large_mcp.pth')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Example: Load model and evaluate
+    model = mobilenet_v3_large(embedding_dim=512)
+    model_path = "weights/mobilenetv3_large_MCP_best.ckpt"
+    
+    if os.path.exists(model_path):
+        state_dict = torch.load(model_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print(f"Loaded model from {model_path}")
+    else:
+        print(f"Model not found at {model_path}")
+    
+    # Evaluate on LFW
+    mean_sim, preds, metrics = eval(
+        model,
+        device=device,
+        val_dataset='lfw',
+        val_root='data/lfw/val',
+        compute_full_metrics=True,
+        save_metrics_path='evaluation_metrics',
+        threshold=0.35
+    )
+    
+    print(f"Mean Similarity: {mean_sim:.4f}")
+    print(f"Total pairs evaluated: {len(preds)}")
