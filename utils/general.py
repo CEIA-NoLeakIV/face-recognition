@@ -52,14 +52,16 @@ class EarlyStopping:
     Combines features like `min_delta` and tracks accuracy (fitness).
     """
 
-    def __init__(self, patience=10, min_delta=0):
+    def __init__(self, patience=10, min_delta=0, verbose=False):
         """
         Args:
             patience (int): Number of epochs to wait after the last improvement.
             min_delta (float): Minimum change in the monitored value to qualify as an improvement.
+            verbose (bool): If True, prints messages about improvements and stopping.
         """
         self.patience = patience
         self.min_delta = min_delta
+        self.verbose = verbose
         self.best_fitness = 0.0  # Best observed metric (e.g., accuracy or loss)
         self.best_epoch = 0
         self.counter = 0
@@ -73,11 +75,19 @@ class EarlyStopping:
             fitness (float): Current metric value to monitor accuracy.
         """
         if fitness >= self.best_fitness + self.min_delta:
+            delta_improvement = fitness - self.best_fitness
             self.best_fitness = fitness
             self.best_epoch = epoch
             self.counter = 0
+            
+            if self.verbose:
+                print(f"EarlyStopping: Improvement detected at epoch {epoch}. "
+                      f"Fitness improved by {delta_improvement:.4f} to {fitness:.4f}")
         else:
             self.counter += 1
+            
+            if self.verbose:
+                print(f"EarlyStopping: No improvement. Counter: {self.counter}/{self.patience}")
 
         if self.counter >= self.patience:
             self.early_stop = True
