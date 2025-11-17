@@ -1,201 +1,145 @@
 import os
-import numpy as np
-from PIL import Image
-from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_score, recall_score, f1_score, accuracy_score
-import matplotlib.pyplot as plt
-
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
 from torchvision import transforms
+from sklearn.metrics import roc_curve, auc, confusion_matrix
 
-from models import (
-    sphere20,
-    sphere36,
-    sphere64,
-    MobileNetV1,
-    MobileNetV2,
-    mobilenet_v3_small,
-    mobilenet_v3_large,
-)
-
-# Import face validation (optional)
-try:
-    from utils.face_validation import FaceValidator, validate_lfw_pairs
-    FACE_VALIDATION_AVAILABLE = True
-except ImportError:
-    FACE_VALIDATION_AVAILABLE = False
-
-
-def extract_deep_features(model, image, device):
-    """
-    Extrai características profundas de uma imagem usando o modelo fornecido.
-    """
+def extract_deep_features(model, img, device):
+    """Extract deep features from an image"""
     transform = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
     
-    image_tensor = transform(image).unsqueeze(0).to(device)
-    features = model(image_tensor).squeeze()
+    img_tensor = transform(img).unsqueeze(0).to(device)
     
-    return features
-
-
-def extract_deep_features_batch(model, images, device, batch_size=64):
-    """
-    Extrai features em batch para maior eficiência.
+    with torch.no_grad():
+        features = model(img_tensor)
     
-    Args:
-        model: Modelo treinado
-        images: Lista de imagens PIL
-        device: Device (cuda/cpu)
-        batch_size: Tamanho do batch
-    
-    Returns:
-        torch.Tensor: Features de shape (N, 512)
-    """
-    transform = transforms.Compose([
-        transforms.Resize((112, 112)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-    ])
-    
-    all_features = []
-    num_batches = (len(images) + batch_size - 1) // batch_size
-    
-    print(f"Processing {len(images)} images in {num_batches} batches...")
-    
-    for i in range(0, len(images), batch_size):
-        batch_images = images[i:i + batch_size]
-        
-        # Transformar batch
-        batch_tensors = torch.stack([transform(img) for img in batch_images])
-        batch_tensors = batch_tensors.to(device)
-        
-        # Forward pass do batch
-        with torch.no_grad():
-            features = model(batch_tensors)
-        
-        all_features.append(features)
-    
-    return torch.cat(all_features, dim=0)
+    return features.squeeze(0).cpu()
 
 
 def compute_metrics_from_predictions(predictions, threshold=0.35):
     """
-    Calcula métricas de classificação a partir das predições.
+    Compute classification metrics from predictions array
     
     Args:
-        predictions: Array com formato [path1, path2, similarity, ground_truth]
-        threshold: Limiar de similaridade para classificação
+        predictions: Array with format [path1, path2, similarity, ground_truth]
+        threshold: Similarity threshold
         
     Returns:
-        dict: Dicionário com todas as métricas calculadas
+        dict: Dictionary with metrics
     """
     if len(predictions) == 0:
         return {}
     
-    # Extrair ground truth e similaridades
+    # Extract ground truth and similarities
     y_true = predictions[:, 3].astype(int)
     similarities = predictions[:, 2].astype(float)
     
-    # Predições binárias baseadas no threshold
+    # Compute predictions based on threshold
     y_pred = (similarities > threshold).astype(int)
     
-    # Calcular métricas básicas
+    # Basic metrics
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    
+    accuracy = accuracy_score(y_true, y_pred)
     precision = precision_score(y_true, y_pred, zero_division=0)
     recall = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
-    accuracy = accuracy_score(y_true, y_pred)
     
-    # Calcular matriz de confusão
+    # Confusion matrix
     cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
     
-    # Calcular taxas de erro
-    far = fp / (fp + tn) if (fp + tn) > 0 else 0  # False Accept Rate
-    frr = fn / (fn + tp) if (fn + tp) > 0 else 0  # False Reject Rate
+    # Statistics
+    mean_similarity = np.mean(similarities)
+    std_similarity = np.std(similarities)
+    min_similarity = np.min(similarities)
+    max_similarity = np.max(similarities)
+    median_similarity = np.median(similarities)
     
-    metrics = {
+    # Find best threshold (maximum accuracy)
+    thresholds = np.linspace(similarities.min(), similarities.max(), 100)
+    accuracies = []
+    for t in thresholds:
+        y_pred_t = (similarities > t).astype(int)
+        acc_t = accuracy_score(y_true, y_pred_t)
+        accuracies.append(acc_t)
+    
+    best_idx = np.argmax(accuracies)
+    best_threshold = thresholds[best_idx]
+    best_accuracy = accuracies[best_idx]
+    
+    return {
+        'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1': f1,
-        'accuracy': accuracy,
         'confusion_matrix': cm,
-        'true_negatives': int(tn),
-        'false_positives': int(fp),
-        'false_negatives': int(fn),
-        'true_positives': int(tp),
-        'far': far,
-        'frr': frr
+        'mean_similarity': mean_similarity,
+        'std_similarity': std_similarity,
+        'min_similarity': min_similarity,
+        'max_similarity': max_similarity,
+        'median_similarity': median_similarity,
+        'best_threshold': best_threshold,
+        'best_accuracy': best_accuracy,
+        'true_negatives': int(cm[0, 0]) if cm.shape == (2, 2) else 0,
+        'false_positives': int(cm[0, 1]) if cm.shape == (2, 2) else 0,
+        'false_negatives': int(cm[1, 0]) if cm.shape == (2, 2) else 0,
+        'true_positives': int(cm[1, 1]) if cm.shape == (2, 2) else 0
     }
-    
-    # Calcular ROC e AUC se houver ambas as classes
-    if len(np.unique(y_true)) > 1:
-        fpr, tpr, thresholds = roc_curve(y_true, similarities)
-        roc_auc = auc(fpr, tpr)
-        
-        # Calcular EER (Equal Error Rate)
-        fnr = 1 - tpr
-        eer_threshold_idx = np.nanargmin(np.absolute((fnr - fpr)))
-        eer = fpr[eer_threshold_idx]
-        eer_threshold = thresholds[eer_threshold_idx]
-        
-        # ✅ CORREÇÃO: Calcular TAR@FAR (Estado da Arte)
-        tar_at_far = {}
-        for far_value in [0.001, 0.01, 0.1]:
-            idx = np.argmin(np.abs(fpr - far_value))  # ✅ Mais próximo
-            tar_at_far[f'TAR@FAR={far_value}'] = tpr[idx]
-        
-        metrics.update({
-            'fpr': fpr,
-            'tpr': tpr,
-            'thresholds': thresholds,
-            'auc': roc_auc,
-            'eer': eer,
-            'eer_threshold': eer_threshold,
-            **tar_at_far
-        })
-    
-    return metrics
 
 
-def plot_roc_curve(predictions, save_path=None):
+def compute_roc_metrics(predictions, save_path=None):
     """
-    Plota e salva a curva ROC.
+    Compute ROC curve and related metrics
     
     Args:
-        predictions: Array com formato [path1, path2, similarity, ground_truth]
-        save_path: Caminho para salvar o gráfico
+        predictions: Array with format [path1, path2, similarity, ground_truth]
+        save_path: Path to save ROC curve plot (optional)
         
     Returns:
-        tuple: (fpr, tpr, auc_score)
+        dict: Dictionary with ROC metrics
     """
     if len(predictions) == 0:
-        return None, None, None
+        return {}
     
     y_true = predictions[:, 3].astype(int)
     similarities = predictions[:, 2].astype(float)
     
-    # Verificar se há ambas as classes
-    if len(np.unique(y_true)) < 2:
-        print("Warning: Cannot compute ROC curve - only one class present in ground truth")
-        return None, None, None
-    
-    fpr, tpr, _ = roc_curve(y_true, similarities)
+    # Compute ROC curve
+    fpr, tpr, thresholds = roc_curve(y_true, similarities)
     roc_auc = auc(fpr, tpr)
     
+    # Compute EER (Equal Error Rate)
+    fnr = 1 - tpr
+    eer_threshold_idx = np.nanargmin(np.absolute(fnr - fpr))
+    eer = fpr[eer_threshold_idx]
+    eer_threshold = thresholds[eer_threshold_idx]
+    
+    # Compute TAR@FAR metrics
+    tar_at_far_001 = tpr[np.where(fpr <= 0.001)[0][-1]] if np.any(fpr <= 0.001) else 0
+    tar_at_far_01 = tpr[np.where(fpr <= 0.01)[0][-1]] if np.any(fpr <= 0.01) else 0
+    tar_at_far_1 = tpr[np.where(fpr <= 0.1)[0][-1]] if np.any(fpr <= 0.1) else 0
+    
+    # Generate plot if save_path provided
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        plt.figure(figsize=(8, 6))
+        plt.figure(figsize=(10, 8))
         plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
         plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
+        plt.plot(fpr[eer_threshold_idx], tpr[eer_threshold_idx], 'ro', markersize=10, 
+                 label=f'EER = {eer:.4f}')
+        
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate', fontsize=12)
-        plt.ylabel('True Positive Rate', fontsize=12)
-        plt.title('ROC Curve', fontsize=14, fontweight='bold')
+        plt.xlabel('False Positive Rate (FAR)', fontsize=12)
+        plt.ylabel('True Positive Rate (TAR)', fontsize=12)
+        plt.title('Receiver Operating Characteristic (ROC) Curve', fontsize=14, fontweight='bold')
         plt.legend(loc="lower right", fontsize=10)
         plt.grid(alpha=0.3)
         plt.tight_layout()
@@ -203,33 +147,42 @@ def plot_roc_curve(predictions, save_path=None):
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
     
-    return fpr, tpr, roc_auc
+    return {
+        'auc': roc_auc,
+        'eer': eer,
+        'eer_threshold': eer_threshold,
+        'TAR@FAR=0.001': tar_at_far_001,
+        'TAR@FAR=0.01': tar_at_far_01,
+        'TAR@FAR=0.1': tar_at_far_1,
+        'fpr': fpr,
+        'tpr': tpr,
+        'thresholds': thresholds,
+        'far': fpr.mean(),
+        'frr': (1 - tpr).mean()
+    }
 
 
-def plot_confusion_matrix(predictions, threshold, save_path=None):
+def compute_confusion_matrix(predictions, threshold, save_path=None):
     """
-    Plota e salva a matriz de confusão.
+    Compute and optionally plot confusion matrix
     
     Args:
-        predictions: Array com formato [path1, path2, similarity, ground_truth]
-        threshold: Limiar de similaridade
-        save_path: Caminho para salvar o gráfico (opcional)
+        predictions: Array with format [path1, path2, similarity, ground_truth]
+        threshold: Similarity threshold
+        save_path: Path to save plot (optional)
         
     Returns:
-        np.ndarray: Matriz de confusão
+        np.ndarray: Confusion matrix
     """
     if len(predictions) == 0:
         return None
     
-    # Extrair ground truth e predições
     y_true = predictions[:, 3].astype(int)
     similarities = predictions[:, 2].astype(float)
     y_pred = (similarities > threshold).astype(int)
     
-    # Calcular matriz de confusão
     cm = confusion_matrix(y_true, y_pred)
     
-    # Gerar visualização se save_path fornecido
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
@@ -243,7 +196,6 @@ def plot_confusion_matrix(predictions, threshold, save_path=None):
         plt.xticks(tick_marks, classes, fontsize=12)
         plt.yticks(tick_marks, classes, fontsize=12)
         
-        # Adicionar valores na matriz
         thresh = cm.max() / 2.
         for i in range(cm.shape[0]):
             for j in range(cm.shape[1]):
@@ -262,11 +214,20 @@ def plot_confusion_matrix(predictions, threshold, save_path=None):
     return cm
 
 
-def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val', 
-         compute_full_metrics=False, save_metrics_path=None, threshold=0.35,
-         face_validator=None, no_face_policy='exclude', batch_size=64):
+def eval(
+    model, 
+    model_path=None, 
+    device=None, 
+    val_dataset='lfw', 
+    val_root='data/lfw/val', 
+    compute_full_metrics=False, 
+    save_metrics_path=None, 
+    threshold=0.35,
+    face_validator=None,
+    no_face_policy='exclude'
+):
     """
-    Evaluate the model on validation dataset (LFW or CelebA)
+    Evaluate the model on validation dataset (LFW or CelebA).
     
     Args:
         model: The model to evaluate
@@ -274,12 +235,11 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         device: Device to run evaluation on
         val_dataset: Dataset to use for validation ('lfw' or 'celeba')
         val_root: Root directory of validation data
-        compute_full_metrics: Se True, calcula métricas completas (ROC, confusion matrix, etc)
-        save_metrics_path: Diretório para salvar gráficos de métricas
-        threshold: Limiar de similaridade para métricas de classificação
-        face_validator: FaceValidator instance for RetinaFace validation (optional)
+        compute_full_metrics: If True, compute complete metrics (ROC, confusion matrix, etc)
+        save_metrics_path: Directory to save metric plots
+        threshold: Similarity threshold for classification metrics
+        face_validator: FaceValidator instance (optional)
         no_face_policy: Policy for images without faces ('exclude' or 'include')
-        batch_size: Batch size for feature extraction (default: 64)
         
     Returns:
         tuple: (mean_similarity, predictions, metrics_dict)
@@ -294,14 +254,13 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
 
     root = val_root
     
-    # Select annotation file and image path logic based on dataset
+    # Select annotation file based on dataset
     if val_dataset == 'lfw':
         ann_file = os.path.join(root, 'lfw_ann.txt')
         try:
             with open(ann_file) as f:
                 lines = f.readlines()
-                # Primeira linha contém o número de pares, pular ela
-                pair_lines = lines[1:]
+                pair_lines = lines[1:]  # Skip header
         except FileNotFoundError:
             print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'. Check the path.")
             return 0.0, np.array([]), {}
@@ -309,80 +268,88 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         ann_file = os.path.join(root, 'celeba_pairs.txt')
         try:
             with open(ann_file) as f:
-                pair_lines = f.readlines()[1:]  # Skip header if exists
+                pair_lines = f.readlines()[1:]  # Skip header
         except FileNotFoundError:
             print(f"ERROR: Annotation file 'celeba_pairs.txt' not found in '{root}'. Check the path.")
             return 0.0, np.array([]), {}
     else:
         raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw' or 'celeba'.")
 
-    # Face validation
-    valid_pairs_list = None
-    face_validation_stats = {}
-    
-    if face_validator is not None and FACE_VALIDATION_AVAILABLE:
+    # Face validation with RetinaFace (if enabled)
+    if face_validator is not None:
         print(f"\n{'='*70}")
-        print("🔍 VALIDATING FACES WITH RETINAFACE")
+        print("FACE VALIDATION WITH RETINAFACE")
         print(f"{'='*70}")
         
-        if val_dataset == 'lfw':
-            valid_pairs_tuples, excluded_pairs, pair_stats = validate_lfw_pairs(
-                face_validator,
-                lfw_root=root,
-                ann_file=ann_file,
-                policy=no_face_policy
-            )
-            
-            # Convert tuples to pair_lines format
-            valid_pairs_list = []
-            for path1, path2, is_same in valid_pairs_tuples:
-                valid_pairs_list.append((path1, path2, is_same))
-            
-            # Store statistics
-            face_validation_stats = pair_stats
-            
-            print(f"\nFace Validation Results:")
-            print(f"  Total pairs:        {pair_stats['total_pairs']}")
-            print(f"  Valid pairs:        {pair_stats['valid_pairs']}")
-            print(f"  Excluded pairs:     {pair_stats['excluded_pairs']} ({pair_stats['exclusion_rate']:.2f}%)")
-            print(f"  Policy:             {no_face_policy.upper()}")
-            
-            if pair_stats['excluded_pairs'] > 0:
-                print(f"\n⚠️  WARNING: {pair_stats['excluded_pairs']} pairs were excluded due to missing face detection")
-            
-            print(f"{'='*70}\n")
+        # Collect all unique image paths from pairs
+        from utils.face_validation import validate_lfw_pairs, print_validation_summary
         
-        elif val_dataset == 'celeba':
-            print("Warning: Face validation for CelebA not fully implemented yet")
-            valid_pairs_list = None
+        valid_pairs, excluded_pairs, face_stats = validate_lfw_pairs(
+            validator=face_validator,
+            lfw_root=root,
+            ann_file=ann_file,
+            policy=no_face_policy
+        )
+        
+        # Print face validation summary
+        print_validation_summary(face_validator)
+        
+        print(f"\nPair Filtering Statistics:")
+        print(f"  Total pairs:     {face_stats['total_pairs']}")
+        print(f"  Valid pairs:     {face_stats['valid_pairs']}")
+        print(f"  Excluded pairs:  {face_stats['excluded_pairs']} ({face_stats['exclusion_rate']:.2f}%)")
+        print(f"  Policy:          {no_face_policy}")
+        print(f"{'='*70}\n")
+        
+        # Use filtered pairs for evaluation
+        pair_lines_filtered = []
+        for path1, path2, is_same in valid_pairs:
+            if val_dataset == 'lfw':
+                # Extract person name and image number from path
+                # Path format: root/PersonName/PersonName_0001.jpg
+                # Handle both / and \ separators
+                parts1 = path1.replace('\\', '/').split('/')
+                parts2 = path2.replace('\\', '/').split('/')
+                
+                person1 = parts1[-2]
+                person2 = parts2[-2]
+                
+                # Extract image number from filename
+                filename1 = parts1[-1]
+                filename2 = parts2[-1]
+                
+                img_num1 = filename1.split('_')[-1].split('.')[0]
+                img_num2 = filename2.split('_')[-1].split('.')[0]
+                
+                if person1 == person2:
+                    # Positive pair: "PersonName img1 img2"
+                    pair_lines_filtered.append(f"{person1} {img_num1} {img_num2}\n")
+                else:
+                    # Negative pair: "Person1 img1 Person2 img2"
+                    pair_lines_filtered.append(f"{person1} {img_num1} {person2} {img_num2}\n")
+        
+        pair_lines = pair_lines_filtered
+        print(f"Evaluating on {len(pair_lines)} validated pairs...")
 
     # Process pairs
-    pairs_to_process = []
-    
-    # If face validation was performed and pairs were filtered
-    if valid_pairs_list is not None:
-        # Use filtered pairs
-        for path1, path2, is_same in valid_pairs_list:
-            pairs_to_process.append((path1, path2, is_same))
-    else:
-        # Use all pairs from annotation file (original behavior)
+    predicts = []
+    with torch.no_grad():
         for line in pair_lines:
             parts = line.strip().split()
 
             if val_dataset == 'lfw':
                 if len(parts) == 3:
+                    # Positive pair
                     person_name, img_num1, img_num2 = parts[0], parts[1], parts[2]
                     
-                    # Format filename as: "Person_Name_0001.jpg"
                     filename1 = f'{person_name}_{int(img_num1):04d}.jpg'
                     filename2 = f'{person_name}_{int(img_num2):04d}.jpg'
                     
-                    # Build full path
                     path1 = os.path.join(root, person_name, filename1)
                     path2 = os.path.join(root, person_name, filename2)
                     is_same = '1'
                 elif len(parts) == 4:
-                    # Pares negativos: pessoa1 img1 pessoa2 img2
+                    # Negative pair
                     person1, img_num1, person2, img_num2 = parts
                     
                     filename1 = f'{person1}_{int(img_num1):04d}.jpg'
@@ -392,157 +359,64 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
                     path2 = os.path.join(root, person2, filename2)
                     is_same = '0'
                 else:
-                    # Skip lines that don't have 3 or 4 columns
                     continue
                     
             elif val_dataset == 'celeba':
                 if len(parts) == 2:
-                    # Format: img1.jpg img2.jpg (both same identity - positive pairs only)
                     filename1, filename2 = parts[0], parts[1]
                     
-                    # CelebA images are in img_align_celeba/img_align_celeba folder
                     path1 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', filename1)
                     path2 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', filename2)
                     is_same = '1'
                 else:
                     continue
-            
-            pairs_to_process.append((path1, path2, is_same))
-    
-    # ✅ BATCH PROCESSING OTIMIZADO
-    print(f"Loading {len(pairs_to_process)} image pairs...")
-    
-    # 1. Carregar todas as imagens primeiro
-    all_images = []
-    valid_pairs = []
-    
-    for path1, path2, is_same in pairs_to_process:
-        try:
-            img1 = Image.open(path1).convert('RGB')
-            img2 = Image.open(path2).convert('RGB')
-            all_images.extend([img1, img2])
-            valid_pairs.append((len(all_images)-2, len(all_images)-1, is_same))
-        except FileNotFoundError:
-            print(f"Warning: Image not found, skipping pair: {path1} or {path2}")
-            continue
-    
-    if len(all_images) == 0:
-        print("Warning: No valid images were loaded.")
-        return 0.0, np.array([]), {}
-    
-    print(f"Extracting features for {len(all_images)} images in batches of {batch_size}...")
-    
-    # 2. Extrair features em batch (MUITO MAIS RÁPIDO!)
-    all_features = extract_deep_features_batch(model, all_images, device, batch_size=batch_size)
-    
-    # 3. Calcular similaridades
-    predicts = []
-    for idx1, idx2, is_same in valid_pairs:
-        f1 = all_features[idx1]
-        f2 = all_features[idx2]
-        
-        distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
-        predicts.append(['', '', distance.item(), is_same])
+
+            try:
+                img1 = Image.open(path1).convert('RGB')
+                img2 = Image.open(path2).convert('RGB')
+            except FileNotFoundError:
+                print(f"Warning: Image not found, skipping pair: {path1} or {path2}")
+                continue
+
+            f1 = extract_deep_features(model, img1, device)
+            f2 = extract_deep_features(model, img2, device)
+
+            distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
+            predicts.append([path1, path2, distance.item(), is_same])
     
     if len(predicts) == 0:
         print("Warning: No valid pairs were processed in the evaluation.")
         return 0.0, np.array([]), {}
-
-    # Convert to numpy array
-    predicts = np.array(predicts)
     
-    # Calculate mean similarity
+    predicts = np.array(predicts, dtype=object)
+    
+    # Basic metric: mean similarity
     similarities = predicts[:, 2].astype(float)
     mean_similarity = np.mean(similarities)
-    std_similarity = np.std(similarities)
     
-    # Initialize metrics dictionary
+    # Initialize metrics dict
     metrics = {
         'mean_similarity': mean_similarity,
-        'std_similarity': std_similarity,
-        'min_similarity': np.min(similarities),
-        'max_similarity': np.max(similarities),
-        'median_similarity': np.median(similarities),
+        'std_similarity': np.std(similarities)
     }
-    
-    # Add face validation statistics to metrics if available
-    if face_validation_stats:
-        metrics['face_validation_stats'] = face_validation_stats
     
     # Compute full metrics if requested
     if compute_full_metrics:
+        # Classification metrics
         classification_metrics = compute_metrics_from_predictions(predicts, threshold)
         metrics.update(classification_metrics)
         
-        # Save visualizations if path provided
+        # ROC metrics
         if save_metrics_path:
-            os.makedirs(save_metrics_path, exist_ok=True)
+            roc_save_path = os.path.join(save_metrics_path, f'{val_dataset}_roc_curve.png')
+            roc_metrics = compute_roc_metrics(predicts, save_path=roc_save_path)
+            metrics.update(roc_metrics)
             
-            # ROC Curve
-            roc_path = os.path.join(save_metrics_path, f'{val_dataset}_roc_curve.png')
-            plot_roc_curve(predicts, save_path=roc_path)
-            
-            # Confusion Matrix
-            cm_path = os.path.join(save_metrics_path, f'{val_dataset}_confusion_matrix.png')
-            plot_confusion_matrix(predicts, threshold, save_path=cm_path)
-    
-    # Print summary
-    print(f"\n{'='*50}")
-    print(f"{val_dataset.upper()} - Evaluation Results:")
-    print(f"Mean Similarity: {mean_similarity:.4f} | Standard Deviation: {std_similarity:.4f}")
-    
-    if compute_full_metrics and 'accuracy' in metrics:
-        print(f"\nAdditional Metrics (Threshold: {threshold:.4f}):")
-        print(f"  Accuracy:  {metrics['accuracy']:.4f}")
-        print(f"  F1 Score:  {metrics['f1']:.4f}")
-        print(f"  Precision: {metrics['precision']:.4f}")
-        print(f"  Recall:    {metrics['recall']:.4f}")
-        if 'auc' in metrics:
-            print(f"  AUC Score: {metrics['auc']:.4f}")
-
-        if 'TAR@FAR=0.001' in metrics:
-            print(f"  TAR@FAR=0.001: {metrics['TAR@FAR=0.001']:.4f}")
-        if 'TAR@FAR=0.01' in metrics:
-            print(f"  TAR@FAR=0.01:  {metrics['TAR@FAR=0.01']:.4f}")
-        if 'TAR@FAR=0.1' in metrics:
-            print(f"  TAR@FAR=0.1:   {metrics['TAR@FAR=0.1']:.4f}")
-        
-        if 'confusion_matrix' in metrics:
-            cm = metrics['confusion_matrix']
-            print(f"\nConfusion Matrix:")
-            print(f"  TN: {metrics['true_negatives']:5d}  FP: {metrics['false_positives']:5d}")
-            print(f"  FN: {metrics['false_negatives']:5d}  TP: {metrics['true_positives']:5d}")
-    
-    print(f"{'='*50}\n")
+            # Confusion matrix
+            cm_save_path = os.path.join(save_metrics_path, f'{val_dataset}_confusion_matrix.png')
+            compute_confusion_matrix(predicts, threshold, save_path=cm_save_path)
+        else:
+            roc_metrics = compute_roc_metrics(predicts)
+            metrics.update(roc_metrics)
     
     return mean_similarity, predicts, metrics
-
-
-if __name__ == '__main__':
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Example: Load model and evaluate
-    model = mobilenet_v3_large(embedding_dim=512)
-    model_path = "weights/mobilenetv3_large_MCP_best.ckpt"
-    
-    if os.path.exists(model_path):
-        state_dict = torch.load(model_path, map_location=device)
-        model.load_state_dict(state_dict)
-        print(f"Loaded model from {model_path}")
-    else:
-        print(f"Model not found at {model_path}")
-    
-    # Evaluate on LFW
-    mean_sim, preds, metrics = eval(
-        model,
-        device=device,
-        val_dataset='lfw',
-        val_root='data/lfw/val',
-        compute_full_metrics=True,
-        save_metrics_path='evaluation_metrics',
-        threshold=0.35,
-        batch_size=64
-    )
-    
-    print(f"Mean Similarity: {mean_sim:.4f}")
-    print(f"Total pairs evaluated: {len(preds)}")

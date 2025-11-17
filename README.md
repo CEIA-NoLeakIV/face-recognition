@@ -10,6 +10,7 @@
 - [Argumentos de Treinamento](#argumentos-de-treinamento)
 - [Validação com RetinaFace](#validação-com-retinaface)
 - [Estrutura de Outputs](#estrutura-de-outputs)
+- [ONNX](#onnx)
 - [Avaliação](#avaliação)
 
 ## Características
@@ -21,9 +22,9 @@
 - **Visualizações**: ROC Curve, Confusion Matrix, Training Curves
 - **Early Stopping**: Patience configurável
 - **Multi-GPU**: Suporte a treinamento distribuído
+- **Exportação ONNX**: Deploy em produção com formato otimizado
 
 ## Instalação
-
 ```bash
 # Dependências básicas
 pip install -r requirements.txt
@@ -32,7 +33,6 @@ pip install -r requirements.txt
 ## Uso Rápido
 
 ### Treinamento Básico
-
 ```bash
 python train.py \
     --root data/train/vggface2_aligned \
@@ -46,7 +46,6 @@ python train.py \
 ```
 
 ### Treinamento com Validação de Faces
-
 ```bash
 python train.py \
     --root data/train/vggface2_aligned \
@@ -91,7 +90,6 @@ Todos os modelos geram embeddings de 512 dimensões.
 - **CelebA**: Dataset de celebridades
 
 **Estrutura esperada:**
-
 ```
 data/
 ├── train/
@@ -193,7 +191,6 @@ Sistema opcional de validação de faces usando RetinaFace da UniFace durante a 
 - **include**: Mantém todos os pares, relatório disponível para auditoria
 
 ### Outputs Gerados
-
 ```
 face_validation_cache/
 └── lfw_validation.json           # Cache de detecções
@@ -209,11 +206,12 @@ weights/metrics/final_evaluation/
 ## Estrutura de Outputs
 
 ### Durante o Treinamento
-
 ```
 weights/
 ├── <model>_<classifier>_best.ckpt    # Melhor modelo
 ├── <model>_<classifier>_last.ckpt    # Último checkpoint
+├── <model>_<classifier>_best.onnx    # Melhor modelo (ONNX)
+├── <model>_<classifier>_last.onnx    # Último checkpoint (ONNX)
 │
 ├── metrics/
 │   ├── epoch_001/
@@ -257,10 +255,71 @@ weights/
 - Pares excluídos
 - Taxa de exclusão
 
+## ONNX
+
+### Exportação
+
+Exporte checkpoints PyTorch para formato ONNX otimizado para deployment em produção.
+
+#### Uso Básico
+```bash
+python scripts/onnx_export.py \
+    --weights weights/mobilenetv3_large_MCP_best.ckpt \
+    --network mobilenetv3_large
+```
+
+#### Com Batch Dinâmico (Recomendado)
+```bash
+python scripts/onnx_export.py \
+    --weights weights/mobilenetv3_large_MCP_best.ckpt \
+    --network mobilenetv3_large \
+    --dynamic
+```
+
+### Argumentos
+
+| Argumento | Tipo | Default | Descrição |
+|-----------|------|---------|-----------|
+| `-w, --weights` | str | `./weights/mobilenetv2_mcp.pth` | Caminho do checkpoint (.ckpt ou .pth) |
+| `-n, --network` | str | `mobilenetv2` | Arquitetura: sphere20/36/64, mobilenetv1/v2/v3_small/v3_large |
+| `--dynamic` | flag | False | Habilita batch size dinâmico |
+
+### Output Gerado
+
+O arquivo ONNX é salvo no mesmo diretório do checkpoint:
+```
+weights/
+├── mobilenetv3_large_MCP_best.ckpt
+└── mobilenetv3_large_MCP_best.onnx    # ← Arquivo exportado
+```
+
+**Especificações:**
+- Input shape: `(batch, 3, 112, 112)`
+- Output shape: `(batch, 512)`
+- Opset version: 16
+- Batch dinâmico: Suporta qualquer tamanho de batch (se `--dynamic` habilitado)
+
+### Inferência
+
+Execute inferência usando modelos ONNX exportados:
+```bash
+python onnx_inference.py
+```
+
+Edite o script para configurar:
+- Caminho do modelo ONNX
+- Paths das imagens a comparar
+- Threshold de similaridade
+
+O script realiza:
+1. Carregamento do modelo ONNX
+2. Detecção de faces com RetinaFace
+3. Extração de embeddings
+4. Comparação de similaridade entre faces
+
 ## Avaliação
 
 ### Standalone
-
 ```bash
 python evaluate.py
 ```
@@ -269,8 +328,7 @@ python evaluate.py
 
 Use `1.Notebooks/Eval.ipynb` para análises detalhadas e visualizações customizadas.
 
-## Retomar Treinamento
-
+### Retomar Treinamento
 ```bash
 python train.py \
     --checkpoint weights/mobilenetv3_large_MCP_last.ckpt \
@@ -282,8 +340,7 @@ python train.py \
 
 O histórico de métricas é preservado automaticamente.
 
-## Multi-GPU
-
+### Multi-GPU
 ```bash
 python -m torch.distributed.launch \
     --nproc_per_node=2 \
@@ -295,7 +352,7 @@ python -m torch.distributed.launch \
     --classifier MCP
 ```
 
-## Preprocessamento
+### Preprocessamento
 
 As imagens devem ser:
 - **Tamanho**: 112x112 pixels

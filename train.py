@@ -19,6 +19,7 @@ from utils.general import (
     EarlyStopping,
     LOGGER,
 )
+from utils.face_validation import FaceValidator, print_validation_summary
 
 from models import (
     sphere20,
@@ -35,7 +36,6 @@ from utils.validation_split import create_validation_split
 def parse_arguments():
     parser = argparse.ArgumentParser(description=("Command-line arguments for training a face recognition model"))
 
-    # Dataset and Paths
     parser.add_argument(
         '--root',
         type=str,
@@ -50,7 +50,6 @@ def parse_arguments():
         help='Database to use for training. Options: WebFace, VggFace2, MS1M, VggFaceHQ.'
     )
 
-    # Model Settings
     parser.add_argument(
         '--network',
         type=str,
@@ -69,7 +68,6 @@ def parse_arguments():
         help='Type of classifier to use. Options: ARC (ArcFace), MCP (MarginCosineProduct), AL (SphereFace), L (Linear).'
     )
 
-    # Training Hyperparameters
     parser.add_argument('--batch-size', type=int, default=512, help='Batch size for training. Default: 512.')
     parser.add_argument('--epochs', type=int, default=30, help='Number of epochs for training. Default: 30.')
     parser.add_argument('--lr', type=float, default=0.1, help='Initial learning rate. Default: 0.1.')
@@ -116,7 +114,6 @@ def parse_arguments():
         help='Frequency (in batches) for printing training progress. Default: 100.'
     )
 
-    # Validation Settings
     parser.add_argument(
         '--val-dataset',
         type=str,
@@ -137,6 +134,31 @@ def parse_arguments():
         help='Similarity threshold for validation metrics. Default: 0.35.'
     )
 
+    parser.add_argument(
+        '--use-retinaface-validation',
+        action='store_true',
+        help='Enable face validation using RetinaFace during evaluation'
+    )
+    parser.add_argument(
+        '--no-face-policy',
+        type=str,
+        default='exclude',
+        choices=['exclude', 'include'],
+        help='Policy for images without detected faces: exclude or include. Default: exclude.'
+    )
+    parser.add_argument(
+        '--retinaface-conf-threshold',
+        type=float,
+        default=0.5,
+        help='Confidence threshold for RetinaFace face detection. Default: 0.5.'
+    )
+    parser.add_argument(
+        '--face-validation-cache-dir',
+        type=str,
+        default='face_validation_cache',
+        help='Directory to cache face validation results. Default: face_validation_cache.'
+    )
+
     parser.add_argument("--world-size", default=1, type=int, help="Number of distributed processes")
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     parser.add_argument(
@@ -149,7 +171,6 @@ def parse_arguments():
 
 
 def validate_model(model, classification_head, val_loader, device):
-    """Validates the model on validation subset"""
     model.eval()
     classification_head.eval()
     
@@ -327,6 +348,20 @@ def main(params):
     metrics_save_path = os.path.join(params.save_path, 'metrics')
     os.makedirs(metrics_save_path, exist_ok=True)
 
+    face_validator = None
+    if params.use_retinaface_validation:
+        try:
+            LOGGER.info("Initializing RetinaFace face validator...")
+            face_validator = FaceValidator(
+                conf_threshold=params.retinaface_conf_threshold,
+                cache_dir=params.face_validation_cache_dir
+            )
+            LOGGER.info("✅ Face validator initialized successfully")
+        except Exception as e:
+            LOGGER.warning(f"⚠️  Could not initialize face validator: {e}")
+            LOGGER.warning("Continuing without face validation")
+            face_validator = None
+
     LOGGER.info('Loading training data.')
     
     train_transform = transforms.Compose([
@@ -446,14 +481,24 @@ def main(params):
                 val_root=params.val_root,
                 compute_full_metrics=True,
                 save_metrics_path=epoch_metrics_path,
-                threshold=params.val_threshold
+                threshold=params.val_threshold,
+                face_validator=face_validator,
+                no_face_policy=params.no_face_policy
             )
             
             LOGGER.info(f'\nValidation Metrics (Threshold={params.val_threshold}):')
-            LOGGER.info(f'  Precision: {metrics["precision"]:.4f}')
-            LOGGER.info(f'  Recall:    {metrics["recall"]:.4f}')
-            LOGGER.info(f'  F1-Score:  {metrics["f1"]:.4f}')
-            LOGGER.info(f'  Accuracy:  {metrics["accuracy"]:.4f}')
+            
+            if not metrics or len(metrics) <= 2:
+                LOGGER.warning(f'  ⚠️  No valid pairs for evaluation!')
+            else:
+                if 'precision' in metrics:
+                    LOGGER.info(f'  Precision: {metrics["precision"]:.4f}')
+                if 'recall' in metrics:
+                    LOGGER.info(f'  Recall:    {metrics["recall"]:.4f}')
+                if 'f1' in metrics:
+                    LOGGER.info(f'  F1-Score:  {metrics["f1"]:.4f}')
+                if 'accuracy' in metrics:
+                    LOGGER.info(f'  Accuracy:  {metrics["accuracy"]:.4f}')
             
             if 'auc' in metrics:
                 LOGGER.info(f'\nROC Metrics:')
@@ -504,34 +549,58 @@ def main(params):
             val_root=params.val_root,
             compute_full_metrics=True,
             save_metrics_path=final_metrics_path,
-            threshold=params.val_threshold
+            threshold=params.val_threshold,
+            face_validator=face_validator,
+            no_face_policy=params.no_face_policy
         )
         
+        if face_validator is not None:
+            report_path = os.path.join(final_metrics_path, 'face_validation_report.json')
+            face_validator.save_validation_report(
+                output_path=report_path,
+                dataset_name=params.val_dataset
+            )
+            print_validation_summary(face_validator)
+        
         LOGGER.info(f'\nFinal Validation Metrics:')
-        LOGGER.info(f'  Mean Similarity: {final_metrics["mean_similarity"]:.4f} ± {final_metrics["std_similarity"]:.4f}')
-        LOGGER.info(f'  Precision:       {final_metrics["precision"]:.4f}')
-        LOGGER.info(f'  Recall:          {final_metrics["recall"]:.4f}')
-        LOGGER.info(f'  F1-Score:        {final_metrics["f1"]:.4f}')
-        LOGGER.info(f'  Accuracy:        {final_metrics["accuracy"]:.4f}')
         
-        if 'auc' in final_metrics:
-            LOGGER.info(f'\nROC Analysis:')
-            LOGGER.info(f'  AUC:             {final_metrics["auc"]:.4f}')
-            LOGGER.info(f'  EER:             {final_metrics["eer"]:.4f} (threshold: {final_metrics["eer_threshold"]:.4f})')
+        if not final_metrics or len(final_metrics) <= 2:
+            LOGGER.warning(f'  ⚠️  No valid pairs for final evaluation!')
+        else:
+            if 'mean_similarity' in final_metrics:
+                LOGGER.info(f'  Mean Similarity: {final_metrics["mean_similarity"]:.4f} ± {final_metrics.get("std_similarity", 0.0):.4f}')
             
-            for key in final_metrics:
-                if key.startswith('TAR@FAR'):
-                    far_value = key.split('=')[1]
-                    LOGGER.info(f'  TAR@FAR={far_value}: {final_metrics[key]:.4f}')
-        
-        if 'confusion_matrix' in final_metrics:
-            LOGGER.info(f'\nConfusion Matrix:')
-            LOGGER.info(f'  True Negatives:  {final_metrics["true_negatives"]}')
-            LOGGER.info(f'  False Positives: {final_metrics["false_positives"]}')
-            LOGGER.info(f'  False Negatives: {final_metrics["false_negatives"]}')
-            LOGGER.info(f'  True Positives:  {final_metrics["true_positives"]}')
-            LOGGER.info(f'\n  FAR (False Accept Rate): {final_metrics["far"]:.4f}')
-            LOGGER.info(f'  FRR (False Reject Rate): {final_metrics["frr"]:.4f}')
+            if 'precision' in final_metrics:
+                LOGGER.info(f'  Precision:       {final_metrics["precision"]:.4f}')
+            if 'recall' in final_metrics:
+                LOGGER.info(f'  Recall:          {final_metrics["recall"]:.4f}')
+            if 'f1' in final_metrics:
+                LOGGER.info(f'  F1-Score:        {final_metrics["f1"]:.4f}')
+            if 'accuracy' in final_metrics:
+                LOGGER.info(f'  Accuracy:        {final_metrics["accuracy"]:.4f}')
+            
+            if 'auc' in final_metrics:
+                LOGGER.info(f'\nROC Analysis:')
+                LOGGER.info(f'  AUC:             {final_metrics["auc"]:.4f}')
+                if 'eer' in final_metrics:
+                    LOGGER.info(f'  EER:             {final_metrics["eer"]:.4f} (threshold: {final_metrics.get("eer_threshold", 0.0):.4f})')
+                
+                for key in final_metrics:
+                    if key.startswith('TAR@FAR'):
+                        far_value = key.split('=')[1]
+                        LOGGER.info(f'  TAR@FAR={far_value}: {final_metrics[key]:.4f}')
+            
+            if 'confusion_matrix' in final_metrics:
+                LOGGER.info(f'\nConfusion Matrix:')
+                LOGGER.info(f'  True Negatives:  {final_metrics.get("true_negatives", 0)}')
+                LOGGER.info(f'  False Positives: {final_metrics.get("false_positives", 0)}')
+                LOGGER.info(f'  False Negatives: {final_metrics.get("false_negatives", 0)}')
+                LOGGER.info(f'  True Positives:  {final_metrics.get("true_positives", 0)}')
+                
+                if 'far' in final_metrics:
+                    LOGGER.info(f'\n  FAR (False Accept Rate): {final_metrics["far"]:.4f}')
+                if 'frr' in final_metrics:
+                    LOGGER.info(f'  FRR (False Reject Rate): {final_metrics["frr"]:.4f}')
         
         LOGGER.info(f'\n{"="*70}')
         LOGGER.info(f'Metrics saved to: {final_metrics_path}')

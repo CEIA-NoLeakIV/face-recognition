@@ -1,11 +1,11 @@
 # Ignorar dados e pesos (grandes demais)
 data/
-weights/*.ckpt
-weights/*.pth
+weights/*
 assets/
 
 # Python cache
 __pycache__/
+face_validation_cache/
 *.pyc
 .ipynb_checkpoints/
 

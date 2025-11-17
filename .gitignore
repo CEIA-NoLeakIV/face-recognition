@@ -1,7 +1,8 @@
 data/
 
-weights/*.ckpt
-weights/*.pth
+weights/*
+
+face_validation_cache/
 
 
 # Byte-compiled / optimized / DLL files

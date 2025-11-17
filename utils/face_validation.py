@@ -22,7 +22,6 @@ class FaceValidator:
     
     def __init__(
         self,
-        gpu_id: int = 0,
         conf_threshold: float = 0.5,
         cache_dir: str = "face_validation_cache"
     ):
@@ -30,17 +29,17 @@ class FaceValidator:
         Initialize FaceValidator
         
         Args:
-            gpu_id: GPU device ID for RetinaFace
             conf_threshold: Confidence threshold for face detection
             cache_dir: Directory to store validation cache files
         """
+        
         if not UNIFACE_AVAILABLE:
             raise ImportError(
                 "uniface package is required for RetinaFace validation. "
                 "Install it with: pip install uniface"
             )
         
-        self.detector = RetinaFace(gpu_id=gpu_id)
+        self.detector = RetinaFace()
         self.conf_threshold = conf_threshold
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
@@ -69,14 +68,23 @@ class FaceValidator:
             # Load image
             img = np.array(Image.open(image_path).convert('RGB'))
             
-            # Detect faces
-            faces = self.detector.detect_faces(img)
+            # Detect faces with uniface RetinaFace
+            boxes, landmarks = self.detector.detect(img)
             
-            # Filter by confidence
-            valid_faces = [
-                f for f in faces 
-                if f.get('confidence', 0) >= self.conf_threshold
-            ]
+            # Check if faces were detected
+            if boxes is None or len(boxes) == 0:
+                return False, 0, "no_face_detected"
+            
+            # Filter by confidence (boxes format: [x1, y1, x2, y2, confidence])
+            valid_faces = []
+            for box in boxes:
+                if len(box) >= 5:  # Has confidence score
+                    confidence = box[4]
+                    if confidence >= self.conf_threshold:
+                        valid_faces.append(box)
+                else:
+                    # No confidence score, include by default
+                    valid_faces.append(box)
             
             num_faces = len(valid_faces)
             
