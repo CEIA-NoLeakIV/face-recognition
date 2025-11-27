@@ -4,6 +4,8 @@ weights/*
 
 face_validation_cache/
 
+landmark_cache/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

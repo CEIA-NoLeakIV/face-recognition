@@ -2,6 +2,7 @@ import os
 import time
 import argparse
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -20,6 +21,7 @@ from utils.general import (
     LOGGER,
 )
 from utils.face_validation import FaceValidator, print_validation_summary
+from utils.landmark_annotator import LandmarkAnnotator
 
 from models import (
     sphere20,
@@ -29,9 +31,11 @@ from models import (
     MobileNetV2,
     mobilenet_v3_small,
     mobilenet_v3_large,
+    create_landmark_conditioned_model,
 )
 
 from utils.validation_split import create_validation_split
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description=("Command-line arguments for training a face recognition model"))
@@ -159,6 +163,31 @@ def parse_arguments():
         help='Directory to cache face validation results. Default: face_validation_cache.'
     )
 
+    # Landmark conditioning arguments
+    parser.add_argument(
+        '--use-landmarks',
+        action='store_true',
+        help='Enable landmark-conditioned face recognition'
+    )
+    parser.add_argument(
+        '--landmark-cache-dir',
+        type=str,
+        default='landmark_cache',
+        help='Directory to cache extracted landmarks. Default: landmark_cache.'
+    )
+    parser.add_argument(
+        '--landmark-dim',
+        type=int,
+        default=128,
+        help='Dimension of landmark embedding. Default: 128.'
+    )
+    parser.add_argument(
+        '--landmark-dropout',
+        type=float,
+        default=0.1,
+        help='Dropout rate for landmark encoder. Default: 0.1.'
+    )
+
     parser.add_argument("--world-size", default=1, type=int, help="Number of distributed processes")
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     parser.add_argument(
@@ -170,7 +199,7 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def validate_model(model, classification_head, val_loader, device):
+def validate_model(model, classification_head, val_loader, device, use_landmarks=False):
     model.eval()
     classification_head.eval()
     
@@ -178,11 +207,19 @@ def validate_model(model, classification_head, val_loader, device):
     total_samples = 0
     
     with torch.no_grad():
-        for images, targets in val_loader:
-            images = images.to(device)
-            targets = targets.to(device)
+        for batch in val_loader:
+            if use_landmarks:
+                images, landmarks, targets = batch
+                images = images.to(device)
+                landmarks = landmarks.to(device)
+                targets = targets.to(device)
+                embeddings = model(images, landmarks)
+            else:
+                images, targets = batch
+                images = images.to(device)
+                targets = targets.to(device)
+                embeddings = model(images)
             
-            embeddings = model(images)
             if isinstance(classification_head, torch.nn.Linear):
                 outputs = classification_head(embeddings)
             else:
@@ -221,7 +258,8 @@ def train_one_epoch(
     data_loader,
     device,
     epoch,
-    params
+    params,
+    use_landmarks=False
 ) -> None:
     model.train()
     losses = AverageMeter("Avg Loss", ":6.3f")
@@ -230,15 +268,25 @@ def train_one_epoch(
     last_batch_idx = len(data_loader) - 1
 
     start_time = time.time()
-    for batch_idx, (images, target) in enumerate(data_loader):
+    for batch_idx, batch in enumerate(data_loader):
         last_batch = last_batch_idx == batch_idx
 
-        images = images.to(device)
-        target = target.to(device)
+        if use_landmarks:
+            images, landmarks, target = batch
+            images = images.to(device)
+            landmarks = landmarks.to(device)
+            target = target.to(device)
+        else:
+            images, target = batch
+            images = images.to(device)
+            target = target.to(device)
 
         optimizer.zero_grad()
 
-        embeddings = model(images)
+        if use_landmarks:
+            embeddings = model(images, landmarks)
+        else:
+            embeddings = model(images)
         
         if isinstance(classification_head, torch.nn.Linear):
             output = classification_head(embeddings)
@@ -250,9 +298,9 @@ def train_one_epoch(
         loss = criterion(output, target)
         accuracy = calculate_accuracy(cosine_output, target)
 
-        if args.distributed:
-            reduced_loss = reduce_tensor(loss, args.world_size)
-            accuracy = reduce_tensor(accuracy, args.world_size)
+        if params.distributed:
+            reduced_loss = reduce_tensor(loss, params.world_size)
+            accuracy = reduce_tensor(accuracy, params.world_size)
         else:
             reduced_loss = loss
 
@@ -313,21 +361,47 @@ def main(params):
     num_classes = db_config[params.database]['num_classes']
 
     LOGGER.info(f'Training on database: {params.database}')
+    
+    if params.use_landmarks:
+        LOGGER.info(f'Landmark-conditioned training ENABLED')
+        LOGGER.info(f'  Landmark embedding dim: {params.landmark_dim}')
+        LOGGER.info(f'  Landmark dropout: {params.landmark_dropout}')
 
-    networks = {
-        'sphere20': sphere20,
-        'sphere36': sphere36,
-        'sphere64': sphere64,
-        'mobilenetv1': MobileNetV1,
-        'mobilenetv2': MobileNetV2,
-        'mobilenetv3_small': mobilenet_v3_small,
-        'mobilenetv3_large': mobilenet_v3_large
-    }
+    # Pre-annotate landmarks if needed
+    landmarks_dict = None
+    if params.use_landmarks:
+        LOGGER.info(f'Pre-annotating landmarks for training dataset...')
+        annotator = LandmarkAnnotator(cache_dir=params.landmark_cache_dir)
+        landmarks_dict = annotator.annotate_dataset(
+            dataset_root=params.root,
+            dataset_name=params.database.lower()
+        )
+        LOGGER.info(f'Landmark annotation complete. {len(landmarks_dict)} images annotated.')
 
-    if params.network not in networks:
-        raise ValueError(f"Unsupported network: {params.network}")
+    # Create model
+    if params.use_landmarks:
+        model = create_landmark_conditioned_model(
+            network_name=params.network,
+            embedding_dim=512,
+            landmark_dim=params.landmark_dim,
+            dropout=params.landmark_dropout
+        )
+    else:
+        networks = {
+            'sphere20': sphere20,
+            'sphere36': sphere36,
+            'sphere64': sphere64,
+            'mobilenetv1': MobileNetV1,
+            'mobilenetv2': MobileNetV2,
+            'mobilenetv3_small': mobilenet_v3_small,
+            'mobilenetv3_large': mobilenet_v3_large
+        }
 
-    model = networks[params.network](embedding_dim=512)
+        if params.network not in networks:
+            raise ValueError(f"Unsupported network: {params.network}")
+
+        model = networks[params.network](embedding_dim=512)
+    
     model.to(device)
 
     classification_head = get_classification_head(params.classifier, 512, num_classes)
@@ -356,9 +430,9 @@ def main(params):
                 conf_threshold=params.retinaface_conf_threshold,
                 cache_dir=params.face_validation_cache_dir
             )
-            LOGGER.info("✅ Face validator initialized successfully")
+            LOGGER.info("Face validator initialized successfully")
         except Exception as e:
-            LOGGER.warning(f"⚠️  Could not initialize face validator: {e}")
+            LOGGER.warning(f"Could not initialize face validator: {e}")
             LOGGER.warning("Continuing without face validation")
             face_validator = None
 
@@ -371,7 +445,13 @@ def main(params):
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
 
-    full_dataset = ImageFolder(root=params.root, transform=train_transform)
+    full_dataset = ImageFolder(
+        root=params.root,
+        transform=train_transform,
+        use_landmarks=params.use_landmarks,
+        landmarks_dict=landmarks_dict,
+        landmark_cache_dir=params.landmark_cache_dir
+    )
     train_dataset, val_dataset = create_validation_split(full_dataset, val_split=0.1)
 
     val_transform = transforms.Compose([
@@ -436,9 +516,11 @@ def main(params):
     curr_accuracy = 0.0
     early_stopping = EarlyStopping(patience=10)
 
-    LOGGER.info(f'Training started for {params.network}, Classifier: {params.classifier}')
+    landmark_suffix = '_landmark' if params.use_landmarks else ''
+    LOGGER.info(f'Training started for {params.network}{landmark_suffix}, Classifier: {params.classifier}')
+    
     for epoch in range(start_epoch, params.epochs):
-        if args.distributed:
+        if params.distributed:
             train_sampler.set_epoch(epoch)
         train_one_epoch(
             model,
@@ -448,11 +530,12 @@ def main(params):
             train_loader,
             device,
             epoch,
-            params
+            params,
+            use_landmarks=params.use_landmarks
         )
         lr_scheduler.step()
 
-        base_filename = f'{params.network}_{params.classifier}'
+        base_filename = f'{params.network}_{params.classifier}{landmark_suffix}'
 
         last_save_path = os.path.join(params.save_path, f'{base_filename}_last.ckpt')
 
@@ -461,7 +544,8 @@ def main(params):
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
             'lr_scheduler': lr_scheduler.state_dict(),
-            'args': params
+            'args': params,
+            'use_landmarks': params.use_landmarks
         }
 
         save_on_master(checkpoint, last_save_path)
@@ -483,13 +567,15 @@ def main(params):
                 save_metrics_path=epoch_metrics_path,
                 threshold=params.val_threshold,
                 face_validator=face_validator,
-                no_face_policy=params.no_face_policy
+                no_face_policy=params.no_face_policy,
+                use_landmarks=params.use_landmarks,
+                landmark_cache_dir=params.landmark_cache_dir
             )
             
             LOGGER.info(f'\nValidation Metrics (Threshold={params.val_threshold}):')
             
             if not metrics or len(metrics) <= 2:
-                LOGGER.warning(f'  ⚠️  No valid pairs for evaluation!')
+                LOGGER.warning(f'  No valid pairs for evaluation!')
             else:
                 if 'precision' in metrics:
                     LOGGER.info(f'  Precision: {metrics["precision"]:.4f}')
@@ -504,6 +590,14 @@ def main(params):
                 LOGGER.info(f'\nROC Metrics:')
                 LOGGER.info(f'  AUC: {metrics["auc"]:.4f}')
                 LOGGER.info(f'  EER: {metrics["eer"]:.4f}')
+                
+                # TAR@FAR metrics
+                if 'TAR@FAR=0.01%' in metrics:
+                    LOGGER.info(f'\nTAR@FAR:')
+                    LOGGER.info(f'  TAR@FAR=0.01%:  {metrics["TAR@FAR=0.01%"]:.4f}')
+                    LOGGER.info(f'  TAR@FAR=0.1%:   {metrics["TAR@FAR=0.1%"]:.4f}')
+                    LOGGER.info(f'  TAR@FAR=1%:     {metrics["TAR@FAR=1%"]:.4f}')
+                    LOGGER.info(f'  TAR@FAR=10%:    {metrics["TAR@FAR=10%"]:.4f}')
             
             if 'far' in metrics and 'frr' in metrics:
                 LOGGER.info(f'\nError Rates:')
@@ -520,7 +614,13 @@ def main(params):
                 pin_memory=True
             )
             
-            val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
+            val_accuracy = validate_model(
+                model_without_ddp,
+                classification_head,
+                val_loader,
+                device,
+                use_landmarks=params.use_landmarks
+            )
             LOGGER.info(f'Internal validation accuracy ({params.database} subset): {val_accuracy:.4f}\n')
 
         if early_stopping(epoch, curr_accuracy):
@@ -551,7 +651,9 @@ def main(params):
             save_metrics_path=final_metrics_path,
             threshold=params.val_threshold,
             face_validator=face_validator,
-            no_face_policy=params.no_face_policy
+            no_face_policy=params.no_face_policy,
+            use_landmarks=params.use_landmarks,
+            landmark_cache_dir=params.landmark_cache_dir
         )
         
         if face_validator is not None:
@@ -565,10 +667,10 @@ def main(params):
         LOGGER.info(f'\nFinal Validation Metrics:')
         
         if not final_metrics or len(final_metrics) <= 2:
-            LOGGER.warning(f'  ⚠️  No valid pairs for final evaluation!')
+            LOGGER.warning(f'  No valid pairs for final evaluation!')
         else:
             if 'mean_similarity' in final_metrics:
-                LOGGER.info(f'  Mean Similarity: {final_metrics["mean_similarity"]:.4f} ± {final_metrics.get("std_similarity", 0.0):.4f}')
+                LOGGER.info(f'  Mean Similarity: {final_metrics["mean_similarity"]:.4f} +/- {final_metrics.get("std_similarity", 0.0):.4f}')
             
             if 'precision' in final_metrics:
                 LOGGER.info(f'  Precision:       {final_metrics["precision"]:.4f}')
@@ -585,10 +687,13 @@ def main(params):
                 if 'eer' in final_metrics:
                     LOGGER.info(f'  EER:             {final_metrics["eer"]:.4f} (threshold: {final_metrics.get("eer_threshold", 0.0):.4f})')
                 
-                for key in final_metrics:
-                    if key.startswith('TAR@FAR'):
-                        far_value = key.split('=')[1]
-                        LOGGER.info(f'  TAR@FAR={far_value}: {final_metrics[key]:.4f}')
+                # TAR@FAR metrics
+                if 'TAR@FAR=0.01%' in final_metrics:
+                    LOGGER.info(f'\nTAR@FAR:')
+                    LOGGER.info(f'  TAR@FAR=0.01%:   {final_metrics["TAR@FAR=0.01%"]:.4f}')
+                    LOGGER.info(f'  TAR@FAR=0.1%:    {final_metrics["TAR@FAR=0.1%"]:.4f}')
+                    LOGGER.info(f'  TAR@FAR=1%:      {final_metrics["TAR@FAR=1%"]:.4f}')
+                    LOGGER.info(f'  TAR@FAR=10%:     {final_metrics["TAR@FAR=10%"]:.4f}')
             
             if 'confusion_matrix' in final_metrics:
                 LOGGER.info(f'\nConfusion Matrix:')

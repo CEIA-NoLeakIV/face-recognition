@@ -5,9 +5,22 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from torchvision import transforms
 from sklearn.metrics import roc_curve, auc, confusion_matrix
+from tqdm import tqdm
 
-def extract_deep_features(model, img, device):
-    """Extract deep features from an image"""
+from utils.landmark_annotator import LandmarkAnnotator, extract_landmarks_single_image
+
+
+def extract_deep_features(
+    model,
+    img,
+    device,
+    use_landmarks=False,
+    landmarks=None,
+    landmark_detector=None
+):
+    """
+    Extract deep features from an image.
+    """
     transform = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.ToTensor(),
@@ -17,7 +30,18 @@ def extract_deep_features(model, img, device):
     img_tensor = transform(img).unsqueeze(0).to(device)
     
     with torch.no_grad():
-        features = model(img_tensor)
+        if use_landmarks:
+            if landmarks is None:
+                img_np = np.array(img)
+                landmarks = extract_landmarks_single_image(img_np, landmark_detector)
+                
+                if landmarks is None:
+                    landmarks = np.zeros((5, 2), dtype=np.float32)
+            
+            landmarks_tensor = torch.from_numpy(landmarks).unsqueeze(0).to(device)
+            features = model(img_tensor, landmarks_tensor)
+        else:
+            features = model(img_tensor)
     
     return features.squeeze(0).cpu()
 
@@ -25,25 +49,14 @@ def extract_deep_features(model, img, device):
 def compute_metrics_from_predictions(predictions, threshold=0.35):
     """
     Compute classification metrics from predictions array
-    
-    Args:
-        predictions: Array with format [path1, path2, similarity, ground_truth]
-        threshold: Similarity threshold
-        
-    Returns:
-        dict: Dictionary with metrics
     """
     if len(predictions) == 0:
         return {}
     
-    # Extract ground truth and similarities
     y_true = predictions[:, 3].astype(int)
     similarities = predictions[:, 2].astype(float)
-    
-    # Compute predictions based on threshold
     y_pred = (similarities > threshold).astype(int)
     
-    # Basic metrics
     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
     
     accuracy = accuracy_score(y_true, y_pred)
@@ -51,17 +64,14 @@ def compute_metrics_from_predictions(predictions, threshold=0.35):
     recall = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
     
-    # Confusion matrix
     cm = confusion_matrix(y_true, y_pred)
     
-    # Statistics
     mean_similarity = np.mean(similarities)
     std_similarity = np.std(similarities)
     min_similarity = np.min(similarities)
     max_similarity = np.max(similarities)
     median_similarity = np.median(similarities)
     
-    # Find best threshold (maximum accuracy)
     thresholds = np.linspace(similarities.min(), similarities.max(), 100)
     accuracies = []
     for t in thresholds:
@@ -96,13 +106,6 @@ def compute_metrics_from_predictions(predictions, threshold=0.35):
 def compute_roc_metrics(predictions, save_path=None):
     """
     Compute ROC curve and related metrics
-    
-    Args:
-        predictions: Array with format [path1, path2, similarity, ground_truth]
-        save_path: Path to save ROC curve plot (optional)
-        
-    Returns:
-        dict: Dictionary with ROC metrics
     """
     if len(predictions) == 0:
         return {}
@@ -110,22 +113,20 @@ def compute_roc_metrics(predictions, save_path=None):
     y_true = predictions[:, 3].astype(int)
     similarities = predictions[:, 2].astype(float)
     
-    # Compute ROC curve
     fpr, tpr, thresholds = roc_curve(y_true, similarities)
     roc_auc = auc(fpr, tpr)
     
-    # Compute EER (Equal Error Rate)
     fnr = 1 - tpr
     eer_threshold_idx = np.nanargmin(np.absolute(fnr - fpr))
     eer = fpr[eer_threshold_idx]
     eer_threshold = thresholds[eer_threshold_idx]
     
-    # Compute TAR@FAR metrics
+    # TAR@FAR metrics
+    tar_at_far_0001 = tpr[np.where(fpr <= 0.0001)[0][-1]] if np.any(fpr <= 0.0001) else 0
     tar_at_far_001 = tpr[np.where(fpr <= 0.001)[0][-1]] if np.any(fpr <= 0.001) else 0
     tar_at_far_01 = tpr[np.where(fpr <= 0.01)[0][-1]] if np.any(fpr <= 0.01) else 0
     tar_at_far_1 = tpr[np.where(fpr <= 0.1)[0][-1]] if np.any(fpr <= 0.1) else 0
     
-    # Generate plot if save_path provided
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
@@ -151,9 +152,10 @@ def compute_roc_metrics(predictions, save_path=None):
         'auc': roc_auc,
         'eer': eer,
         'eer_threshold': eer_threshold,
-        'TAR@FAR=0.001': tar_at_far_001,
-        'TAR@FAR=0.01': tar_at_far_01,
-        'TAR@FAR=0.1': tar_at_far_1,
+        'TAR@FAR=0.01%': tar_at_far_0001,
+        'TAR@FAR=0.1%': tar_at_far_001,
+        'TAR@FAR=1%': tar_at_far_01,
+        'TAR@FAR=10%': tar_at_far_1,
         'fpr': fpr,
         'tpr': tpr,
         'thresholds': thresholds,
@@ -165,14 +167,6 @@ def compute_roc_metrics(predictions, save_path=None):
 def compute_confusion_matrix(predictions, threshold, save_path=None):
     """
     Compute and optionally plot confusion matrix
-    
-    Args:
-        predictions: Array with format [path1, path2, similarity, ground_truth]
-        threshold: Similarity threshold
-        save_path: Path to save plot (optional)
-        
-    Returns:
-        np.ndarray: Confusion matrix
     """
     if len(predictions) == 0:
         return None
@@ -224,25 +218,12 @@ def eval(
     save_metrics_path=None, 
     threshold=0.35,
     face_validator=None,
-    no_face_policy='exclude'
+    no_face_policy='exclude',
+    use_landmarks=False,
+    landmark_cache_dir='landmark_cache'
 ):
     """
     Evaluate the model on validation dataset (LFW or CelebA).
-    
-    Args:
-        model: The model to evaluate
-        model_path: Path to model weights (optional)
-        device: Device to run evaluation on
-        val_dataset: Dataset to use for validation ('lfw' or 'celeba')
-        val_root: Root directory of validation data
-        compute_full_metrics: If True, compute complete metrics (ROC, confusion matrix, etc)
-        save_metrics_path: Directory to save metric plots
-        threshold: Similarity threshold for classification metrics
-        face_validator: FaceValidator instance (optional)
-        no_face_policy: Policy for images without faces ('exclude' or 'include')
-        
-    Returns:
-        tuple: (mean_similarity, predictions, metrics_dict)
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,34 +235,49 @@ def eval(
 
     root = val_root
     
+    # Inicializa detector de landmarks se necessário
+    landmark_detector = None
+    landmarks_cache = {}
+    
+    if use_landmarks:
+        try:
+            from uniface import RetinaFace
+            landmark_detector = RetinaFace()
+            
+            # Tenta carregar cache de landmarks
+            annotator = LandmarkAnnotator(cache_dir=landmark_cache_dir)
+            cache_path = annotator._get_cache_path(val_dataset)
+            if cache_path.exists():
+                import json
+                with open(cache_path, 'r') as f:
+                    cached_data = json.load(f)
+                landmarks_cache = cached_data.get('landmarks', {})
+        except ImportError:
+            pass
+    
     # Select annotation file based on dataset
     if val_dataset == 'lfw':
         ann_file = os.path.join(root, 'lfw_ann.txt')
         try:
             with open(ann_file) as f:
                 lines = f.readlines()
-                pair_lines = lines[1:]  # Skip header
+                pair_lines = lines[1:]
         except FileNotFoundError:
-            print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'. Check the path.")
+            print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'.")
             return 0.0, np.array([]), {}
     elif val_dataset == 'celeba':
         ann_file = os.path.join(root, 'celeba_pairs.txt')
         try:
             with open(ann_file) as f:
-                pair_lines = f.readlines()[1:]  # Skip header
+                pair_lines = f.readlines()[1:]
         except FileNotFoundError:
-            print(f"ERROR: Annotation file 'celeba_pairs.txt' not found in '{root}'. Check the path.")
+            print(f"ERROR: Annotation file 'celeba_pairs.txt' not found in '{root}'.")
             return 0.0, np.array([]), {}
     else:
-        raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw' or 'celeba'.")
+        raise ValueError(f"Unsupported validation dataset: {val_dataset}.")
 
     # Face validation with RetinaFace (if enabled)
     if face_validator is not None:
-        print(f"\n{'='*70}")
-        print("FACE VALIDATION WITH RETINAFACE")
-        print(f"{'='*70}")
-        
-        # Collect all unique image paths from pairs
         from utils.face_validation import validate_lfw_pairs, print_validation_summary
         
         valid_pairs, excluded_pairs, face_stats = validate_lfw_pairs(
@@ -291,30 +287,17 @@ def eval(
             policy=no_face_policy
         )
         
-        # Print face validation summary
         print_validation_summary(face_validator)
         
-        print(f"\nPair Filtering Statistics:")
-        print(f"  Total pairs:     {face_stats['total_pairs']}")
-        print(f"  Valid pairs:     {face_stats['valid_pairs']}")
-        print(f"  Excluded pairs:  {face_stats['excluded_pairs']} ({face_stats['exclusion_rate']:.2f}%)")
-        print(f"  Policy:          {no_face_policy}")
-        print(f"{'='*70}\n")
-        
-        # Use filtered pairs for evaluation
         pair_lines_filtered = []
         for path1, path2, is_same in valid_pairs:
             if val_dataset == 'lfw':
-                # Extract person name and image number from path
-                # Path format: root/PersonName/PersonName_0001.jpg
-                # Handle both / and \ separators
                 parts1 = path1.replace('\\', '/').split('/')
                 parts2 = path2.replace('\\', '/').split('/')
                 
                 person1 = parts1[-2]
                 person2 = parts2[-2]
                 
-                # Extract image number from filename
                 filename1 = parts1[-1]
                 filename2 = parts2[-1]
                 
@@ -322,24 +305,22 @@ def eval(
                 img_num2 = filename2.split('_')[-1].split('.')[0]
                 
                 if person1 == person2:
-                    # Positive pair: "PersonName img1 img2"
                     pair_lines_filtered.append(f"{person1} {img_num1} {img_num2}\n")
                 else:
-                    # Negative pair: "Person1 img1 Person2 img2"
                     pair_lines_filtered.append(f"{person1} {img_num1} {person2} {img_num2}\n")
         
         pair_lines = pair_lines_filtered
-        print(f"Evaluating on {len(pair_lines)} validated pairs...")
 
     # Process pairs
     predicts = []
+    skipped = 0
+    
     with torch.no_grad():
-        for line in pair_lines:
+        for line in tqdm(pair_lines, desc="Evaluating pairs", unit="pair"):
             parts = line.strip().split()
 
             if val_dataset == 'lfw':
                 if len(parts) == 3:
-                    # Positive pair
                     person_name, img_num1, img_num2 = parts[0], parts[1], parts[2]
                     
                     filename1 = f'{person_name}_{int(img_num1):04d}.jpg'
@@ -349,7 +330,6 @@ def eval(
                     path2 = os.path.join(root, person_name, filename2)
                     is_same = '1'
                 elif len(parts) == 4:
-                    # Negative pair
                     person1, img_num1, person2, img_num2 = parts
                     
                     filename1 = f'{person1}_{int(img_num1):04d}.jpg'
@@ -375,44 +355,65 @@ def eval(
                 img1 = Image.open(path1).convert('RGB')
                 img2 = Image.open(path2).convert('RGB')
             except FileNotFoundError:
-                print(f"Warning: Image not found, skipping pair: {path1} or {path2}")
+                skipped += 1
                 continue
 
-            f1 = extract_deep_features(model, img1, device)
-            f2 = extract_deep_features(model, img2, device)
+            # Obtém landmarks do cache ou extrai em tempo real
+            landmarks1 = None
+            landmarks2 = None
+            
+            if use_landmarks:
+                rel_path1 = os.path.relpath(path1, root) if root in path1 else path1
+                rel_path2 = os.path.relpath(path2, root) if root in path2 else path2
+                
+                if rel_path1 in landmarks_cache:
+                    landmarks1 = np.array(landmarks_cache[rel_path1], dtype=np.float32)
+                
+                if rel_path2 in landmarks_cache:
+                    landmarks2 = np.array(landmarks_cache[rel_path2], dtype=np.float32)
+
+            f1 = extract_deep_features(
+                model, img1, device,
+                use_landmarks=use_landmarks,
+                landmarks=landmarks1,
+                landmark_detector=landmark_detector
+            )
+            f2 = extract_deep_features(
+                model, img2, device,
+                use_landmarks=use_landmarks,
+                landmarks=landmarks2,
+                landmark_detector=landmark_detector
+            )
 
             distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
             predicts.append([path1, path2, distance.item(), is_same])
     
+    if skipped > 0:
+        print(f"Skipped {skipped} pairs (images not found)")
+    
     if len(predicts) == 0:
-        print("Warning: No valid pairs were processed in the evaluation.")
+        print("Warning: No valid pairs were processed.")
         return 0.0, np.array([]), {}
     
     predicts = np.array(predicts, dtype=object)
     
-    # Basic metric: mean similarity
     similarities = predicts[:, 2].astype(float)
     mean_similarity = np.mean(similarities)
     
-    # Initialize metrics dict
     metrics = {
         'mean_similarity': mean_similarity,
         'std_similarity': np.std(similarities)
     }
     
-    # Compute full metrics if requested
     if compute_full_metrics:
-        # Classification metrics
         classification_metrics = compute_metrics_from_predictions(predicts, threshold)
         metrics.update(classification_metrics)
         
-        # ROC metrics
         if save_metrics_path:
             roc_save_path = os.path.join(save_metrics_path, f'{val_dataset}_roc_curve.png')
             roc_metrics = compute_roc_metrics(predicts, save_path=roc_save_path)
             metrics.update(roc_metrics)
             
-            # Confusion matrix
             cm_save_path = os.path.join(save_metrics_path, f'{val_dataset}_confusion_matrix.png')
             compute_confusion_matrix(predicts, threshold, save_path=cm_save_path)
         else:

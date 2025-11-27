@@ -8,6 +8,7 @@ __pycache__/
 face_validation_cache/
 *.pyc
 .ipynb_checkpoints/
+landmark_cache/
 
 # Git
 .git/
