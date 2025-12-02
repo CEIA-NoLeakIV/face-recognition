@@ -1,20 +1,29 @@
-# Ignorar dados e pesos (grandes demais)
+# --- Dados e Pesos ---
 data/
-weights/*
+weights/
 assets/
 
-# Python cache
+# --- Python & Cache (O que você pediu) ---
 __pycache__/
-face_validation_cache/
-landmark_cache/
 *.pyc
 .ipynb_checkpoints/
+face_validation_cache/
 landmark_cache/
 
-# Git
+# --- Ambientes Virtuais (Essencial para não quebrar o build) ---
+venv/
+.venv/
+env/
+
+# --- Segurança (CRÍTICO) ---
+.env
+.env.local
+.env.*
+
+# --- Git & Docker ---
 .git/
 .gitignore
-
-# Docker
 Dockerfile
 .dockerignore
+docker-compose.yml
+README.md
