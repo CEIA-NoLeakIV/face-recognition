@@ -6,6 +6,7 @@ assets/
 # Python cache
 __pycache__/
 face_validation_cache/
+landmark_cache/
 *.pyc
 .ipynb_checkpoints/
 landmark_cache/
