@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from PIL import Image
 from tqdm import tqdm
+import torch
+import traceback
 
 try:
     from uniface import RetinaFace
@@ -20,6 +22,7 @@ class LandmarkAnnotator:
     """
     Anota landmarks faciais para todas as imagens de um dataset.
     Salva em cache JSON para evitar reprocessamento.
+    Versão Híbrida: Suporta Uniface antigo (tupla) e novo (lista de dicts).
     """
     
     def __init__(
@@ -55,10 +58,24 @@ class LandmarkAnnotator:
         }
     
     def _init_detector(self):
-        """Inicializa detector apenas quando necessário"""
+        """Inicializa detector na GPU ativa se disponível"""
         if self.detector is None:
             LOGGER.info("Initializing RetinaFace detector...")
-            self.detector = RetinaFace()
+            try:
+                # Tenta usar a GPU atual do PyTorch (respeita o docker run --gpus)
+                if torch.cuda.is_available():
+                    current_gpu = torch.cuda.current_device()
+                    gpu_name = torch.cuda.get_device_name(current_gpu)
+                    LOGGER.info(f"Attempting to load RetinaFace on GPU ID {current_gpu}: {gpu_name}")
+                    
+                    # Usa o ID dinâmico da GPU atual
+                    self.detector = RetinaFace(gpu_id=current_gpu)
+                else:
+                    self.detector = RetinaFace()
+            except Exception as e:
+                LOGGER.warning(f"Could not force GPU ({e}). Falling back to default initialization.")
+                self.detector = RetinaFace()
+            
             LOGGER.info("RetinaFace detector initialized")
     
     def _get_cache_path(self, dataset_name: str) -> Path:
@@ -67,37 +84,64 @@ class LandmarkAnnotator:
     
     def _extract_landmarks(self, image_path: str) -> Optional[List[List[float]]]:
         """
-        Extrai landmarks de uma imagem.
-        
-        Args:
-            image_path: Caminho da imagem
-            
-        Returns:
-            Lista de 5 pontos [[x1,y1], [x2,y2], ...] normalizados ou None se falhar
+        Extrai landmarks de uma imagem lidando com diferentes versões da lib.
         """
         try:
             img = np.array(Image.open(image_path).convert('RGB'))
-            boxes, landmarks = self.detector.detect(img)
             
-            # Sem detecção
-            if boxes is None or len(boxes) == 0:
+            # --- PONTO CRÍTICO: Captura o resultado sem desempacotar ---
+            raw_result = self.detector.detect(img)
+            
+            if not raw_result:
                 return None
-            
-            # Filtra por confiança
-            valid_idx = None
-            for i, box in enumerate(boxes):
-                if len(box) >= 5 and box[4] >= self.conf_threshold:
-                    valid_idx = i
-                    break
-            
-            if valid_idx is None:
+
+            selected_landmarks = None
+
+            # --- CASO 1: Versão Nova (Lista de Dicionários) ---
+            # Ex: [{'bbox': [...], 'confidence': 0.99, 'landmarks': [...]}]
+            if isinstance(raw_result, list) and len(raw_result) > 0 and isinstance(raw_result[0], dict):
+                
+                # Encontrar a melhor face baseada na confiança
+                best_face = None
+                best_conf = -1.0
+                
+                for face in raw_result:
+                    # Algumas versões usam 'score', outras 'confidence'
+                    conf = face.get('confidence', face.get('score', 0.0))
+                    
+                    if conf >= self.conf_threshold and conf > best_conf:
+                        best_conf = conf
+                        best_face = face
+                
+                if best_face is not None:
+                    # Algumas versões usam 'landmarks', outras 'kps'
+                    selected_landmarks = best_face.get('landmarks', best_face.get('kps'))
+
+            # --- CASO 2: Versão Antiga (Tupla de Arrays) ---
+            # Ex: (boxes, landmarks)
+            elif isinstance(raw_result, tuple) and len(raw_result) == 2:
+                boxes, landmarks_list = raw_result
+                
+                if boxes is not None and len(boxes) > 0:
+                    valid_idx = None
+                    # boxes formato: [x1, y1, x2, y2, score]
+                    for i, box in enumerate(boxes):
+                        if len(box) >= 5 and box[4] >= self.conf_threshold:
+                            valid_idx = i
+                            break
+                    
+                    if valid_idx is not None:
+                        selected_landmarks = landmarks_list[valid_idx]
+
+            # --- Se não encontrou nada em nenhum formato ---
+            if selected_landmarks is None:
                 return None
-            
-            # Pega landmarks da face mais confiável
-            lmks = landmarks[valid_idx]  # Shape: (5, 2)
-            
-            # Normaliza para [0, 1] baseado no tamanho da imagem
+
+            # --- Normalização e Retorno ---
+            # Garante que é numpy array
+            lmks = np.array(selected_landmarks)
             h, w = img.shape[:2]
+            
             normalized = []
             for point in lmks:
                 normalized.append([
@@ -108,6 +152,13 @@ class LandmarkAnnotator:
             return normalized
             
         except Exception as e:
+            # Imprime erro detalhado apenas na primeira falha para debug
+            if self.stats['failed'] == 0: 
+                print(f"CRITICAL ERROR ON IMAGE {image_path}: {str(e)}")
+                print(f"Retorno do detector (tipo): {type(raw_result) if 'raw_result' in locals() else 'Unknown'}")
+                if 'raw_result' in locals():
+                    print(f"Retorno (conteúdo): {raw_result}")
+                traceback.print_exc()
             return None
     
     def annotate_dataset(
@@ -118,28 +169,27 @@ class LandmarkAnnotator:
     ) -> Dict[str, List[List[float]]]:
         """
         Anota todas as imagens de um dataset.
-        
-        Args:
-            dataset_root: Diretório raiz do dataset
-            dataset_name: Nome para identificar o cache
-            force_reannotate: Se True, ignora cache existente
-            
-        Returns:
-            Dict mapeando image_path -> landmarks
         """
         cache_path = self._get_cache_path(dataset_name)
         
         # Tenta carregar do cache
         if cache_path.exists() and not force_reannotate:
             LOGGER.info(f"Loading landmarks from cache: {cache_path}")
-            with open(cache_path, 'r') as f:
-                cached_data = json.load(f)
-            
-            self.stats = cached_data.get('stats', self.stats)
-            landmarks_dict = cached_data.get('landmarks', {})
-            
-            self._log_stats()
-            return landmarks_dict
+            try:
+                with open(cache_path, 'r') as f:
+                    cached_data = json.load(f)
+                
+                self.stats = cached_data.get('stats', self.stats)
+                landmarks_dict = cached_data.get('landmarks', {})
+                
+                # Sanity check: se o cache está vazio ou corrompido, força reanotação
+                if len(landmarks_dict) == 0 and self.stats.get('total_images', 0) > 0:
+                    LOGGER.warning("Cache seems empty/failed. Forcing reannotation...")
+                else:
+                    self._log_stats()
+                    return landmarks_dict
+            except json.JSONDecodeError:
+                LOGGER.warning("Cache corrupted. Reannotating...")
         
         # Inicializa detector
         self._init_detector()
@@ -229,14 +279,6 @@ class LandmarkAnnotator:
     ) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
         """
         Filtra samples válidos (que possuem landmarks).
-        
-        Args:
-            samples: Lista de (image_path, label) do dataset original
-            landmarks_dict: Dict de landmarks anotados
-            dataset_root: Raiz do dataset para calcular caminho relativo
-            
-        Returns:
-            Tuple de (valid_samples, excluded_samples)
         """
         valid = []
         excluded = []
@@ -262,14 +304,6 @@ class LandmarkAnnotator:
     ) -> Optional[np.ndarray]:
         """
         Obtém landmarks para uma imagem específica.
-        
-        Args:
-            image_path: Caminho absoluto da imagem
-            landmarks_dict: Dict de landmarks
-            dataset_root: Raiz do dataset
-            
-        Returns:
-            np.ndarray de shape (5, 2) ou None
         """
         rel_path = os.path.relpath(image_path, dataset_root)
         
@@ -286,39 +320,50 @@ def extract_landmarks_single_image(
 ) -> Optional[np.ndarray]:
     """
     Extrai landmarks de uma única imagem (para inferência).
-    
-    Args:
-        image: Imagem como np.ndarray (RGB)
-        detector: Instância do RetinaFace (cria nova se None)
-        conf_threshold: Threshold de confiança
-        
-    Returns:
-        np.ndarray de shape (5, 2) normalizado ou None
+    Versão Híbrida (Tupla ou Dict).
     """
     if detector is None:
-        detector = RetinaFace()
+        # Tenta usar GPU ativa se disponível ao criar nova instância
+        if torch.cuda.is_available():
+            gpu_id = torch.cuda.current_device()
+        else:
+            gpu_id = -1
+            
+        detector = RetinaFace(gpu_id=gpu_id)
     
     try:
-        boxes, landmarks = detector.detect(image)
+        raw_result = detector.detect(image)
         
-        if boxes is None or len(boxes) == 0:
+        if not raw_result:
             return None
         
-        # Encontra face mais confiável
-        valid_idx = None
-        best_conf = 0
-        for i, box in enumerate(boxes):
-            if len(box) >= 5 and box[4] >= conf_threshold:
-                if box[4] > best_conf:
-                    best_conf = box[4]
-                    valid_idx = i
+        selected_landmarks = None
+
+        # --- Lógica Híbrida (Igual à classe acima) ---
         
-        if valid_idx is None:
+        # Caso Lista de Dicts (Novo)
+        if isinstance(raw_result, list) and len(raw_result) > 0 and isinstance(raw_result[0], dict):
+            best_conf = -1.0
+            for face in raw_result:
+                conf = face.get('confidence', face.get('score', 0.0))
+                if conf >= conf_threshold and conf > best_conf:
+                    best_conf = conf
+                    selected_landmarks = face.get('landmarks', face.get('kps'))
+        
+        # Caso Tupla (Antigo)
+        elif isinstance(raw_result, tuple) and len(raw_result) == 2:
+            boxes, landmarks_list = raw_result
+            if boxes is not None and len(boxes) > 0:
+                for i, box in enumerate(boxes):
+                    if len(box) >= 5 and box[4] >= conf_threshold:
+                        selected_landmarks = landmarks_list[i]
+                        break # Pega o primeiro válido
+
+        if selected_landmarks is None:
             return None
-        
-        lmks = landmarks[valid_idx]
         
         # Normaliza
+        lmks = np.array(selected_landmarks)
         h, w = image.shape[:2]
         normalized = np.array([
             [lmks[i][0] / w, lmks[i][1] / h]
