@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from PIL import Image
 from tqdm import tqdm
+import traceback
 
 try:
     from uniface import RetinaFace
@@ -17,7 +18,8 @@ except ImportError:
 
 class FaceValidator:
     """
-    Validates faces in datasets using RetinaFace detector from UniFace
+    Validates faces in datasets using RetinaFace detector from UniFace.
+    Robust hybrid version (Tuples vs Dicts) + GPU compatibility fix.
     """
     
     def __init__(
@@ -25,26 +27,20 @@ class FaceValidator:
         conf_threshold: float = 0.5,
         cache_dir: str = "face_validation_cache"
     ):
-        """
-        Initialize FaceValidator
-        
-        Args:
-            conf_threshold: Confidence threshold for face detection
-            cache_dir: Directory to store validation cache files
-        """
-        
         if not UNIFACE_AVAILABLE:
-            raise ImportError(
-                "uniface package is required for RetinaFace validation. "
-                "Install it with: pip install uniface"
-            )
+            raise ImportError("uniface package is required. Install it with: pip install uniface")
         
-        self.detector = RetinaFace()
         self.conf_threshold = conf_threshold
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
         
-        # Statistics
+        try:
+            self.detector = RetinaFace()
+        except Exception as e:
+            print(f"Warning: Error initializing RetinaFace: {e}")
+            # Tenta fallback básico se falhar
+            self.detector = RetinaFace()
+        
         self.validation_results = {}
         self.stats = {
             'total_images': 0,
@@ -56,47 +52,49 @@ class FaceValidator:
     
     def detect_face(self, image_path: str) -> Tuple[bool, int, str]:
         """
-        Detect faces in a single image
-        
-        Args:
-            image_path: Path to image file
-            
-        Returns:
-            Tuple of (has_valid_face, num_faces, status_message)
+        Detect faces in a single image (Hybrid Logic).
+        Returns: (has_valid_face, num_faces, status_message)
         """
         try:
-            # Load image
             img = np.array(Image.open(image_path).convert('RGB'))
             
-            # Detect faces with uniface RetinaFace
-            boxes, landmarks = self.detector.detect(img)
+            raw_result = self.detector.detect(img)
             
-            # Check if faces were detected
-            if boxes is None or len(boxes) == 0:
+            num_valid_faces = 0
+            
+            if not raw_result:
                 return False, 0, "no_face_detected"
+
+            # --- Lógica Híbrida ---
             
-            # Filter by confidence (boxes format: [x1, y1, x2, y2, confidence])
-            valid_faces = []
-            for box in boxes:
-                if len(box) >= 5:  # Has confidence score
-                    confidence = box[4]
-                    if confidence >= self.conf_threshold:
-                        valid_faces.append(box)
-                else:
-                    # No confidence score, include by default
-                    valid_faces.append(box)
+            # CASO 1: Lista de Dicionários
+            if isinstance(raw_result, list) and len(raw_result) > 0 and isinstance(raw_result[0], dict):
+                for face in raw_result:
+                    # Confiança pode vir como 'confidence' ou 'score'
+                    conf = face.get('confidence', face.get('score', 0.0))
+                    if conf >= self.conf_threshold:
+                        num_valid_faces += 1
+
+            # CASO 2: Tupla
+            elif isinstance(raw_result, tuple) and len(raw_result) == 2:
+                boxes, _ = raw_result
+                if boxes is not None:
+                    for box in boxes:
+                        # box: [x1, y1, x2, y2, score]
+                        if len(box) >= 5 and box[4] >= self.conf_threshold:
+                            num_valid_faces += 1
             
-            num_faces = len(valid_faces)
-            
-            if num_faces == 0:
+            # --- Resultado Final ---
+            if num_valid_faces == 0:
                 return False, 0, "no_face_detected"
-            elif num_faces == 1:
+            elif num_valid_faces == 1:
                 return True, 1, "valid"
             else:
-                return False, num_faces, "multiple_faces"
+                return False, num_valid_faces, "multiple_faces"
                 
         except Exception as e:
-            return False, 0, f"error: {str(e)}"
+            # Em caso de erro de leitura de imagem ou corrupção
+            return False, 0, "error_processing"
     
     def validate_dataset_images(
         self,
@@ -104,30 +102,23 @@ class FaceValidator:
         dataset_name: str = "validation",
         force_revalidate: bool = False
     ) -> Dict[str, dict]:
-        """
-        Validate all images in a list
-        
-        Args:
-            image_paths: List of image paths to validate
-            dataset_name: Name for caching purposes
-            force_revalidate: If True, ignore cache and revalidate
-            
-        Returns:
-            Dictionary mapping image_path -> validation_result
-        """
         cache_file = self.cache_dir / f"{dataset_name}_validation.json"
         
-        # Try to load from cache
         if cache_file.exists() and not force_revalidate:
             print(f"Loading validation results from cache: {cache_file}")
-            with open(cache_file, 'r') as f:
-                self.validation_results = json.load(f)
-            self._update_stats_from_results()
-            return self.validation_results
+            try:
+                with open(cache_file, 'r') as f:
+                    self.validation_results = json.load(f)
+                self._update_stats_from_results()
+                return self.validation_results
+            except json.JSONDecodeError:
+                print("Cache corrupted. Revalidating...")
         
-        # Validate images
         print(f"Validating {len(image_paths)} images with RetinaFace...")
         self.validation_results = {}
+        
+        # Reset stats for new validation run
+        self.stats = {k: 0 for k in self.stats}
         
         for img_path in tqdm(image_paths, desc="Face Detection"):
             has_face, num_faces, status = self.detect_face(img_path)
@@ -138,7 +129,6 @@ class FaceValidator:
                 'status': status
             }
             
-            # Update statistics
             self.stats['total_images'] += 1
             if status == "valid":
                 self.stats['faces_detected'] += 1
@@ -149,7 +139,6 @@ class FaceValidator:
             else:
                 self.stats['failed_images'] += 1
         
-        # Save to cache
         with open(cache_file, 'w') as f:
             json.dump(self.validation_results, f, indent=2)
         
@@ -157,7 +146,6 @@ class FaceValidator:
         return self.validation_results
     
     def _update_stats_from_results(self):
-        """Update statistics from loaded validation results"""
         self.stats = {
             'total_images': len(self.validation_results),
             'faces_detected': 0,
@@ -178,7 +166,6 @@ class FaceValidator:
                 self.stats['failed_images'] += 1
     
     def get_validation_stats(self) -> Dict:
-        """Get validation statistics"""
         total = self.stats['total_images']
         if total == 0:
             return self.stats
@@ -191,21 +178,7 @@ class FaceValidator:
             'error_rate': self.stats['failed_images'] / total * 100
         }
     
-    def filter_valid_images(
-        self,
-        image_paths: List[str],
-        policy: str = 'exclude'
-    ) -> Tuple[List[str], List[str]]:
-        """
-        Filter images based on face detection results
-        
-        Args:
-            image_paths: List of image paths to filter
-            policy: 'exclude' to remove invalid images, 'include' to keep all
-            
-        Returns:
-            Tuple of (valid_images, excluded_images)
-        """
+    def filter_valid_images(self, image_paths: List[str], policy: str = 'exclude'):
         if policy == 'include':
             return image_paths, []
         
@@ -214,7 +187,6 @@ class FaceValidator:
         
         for img_path in image_paths:
             if img_path not in self.validation_results:
-                # If not validated, include by default
                 valid_images.append(img_path)
                 continue
             
@@ -226,19 +198,7 @@ class FaceValidator:
         
         return valid_images, excluded_images
     
-    def save_validation_report(
-        self,
-        output_path: str,
-        dataset_name: str = "validation"
-    ):
-        """
-        Save detailed validation report as JSON
-        
-        Args:
-            output_path: Path to save the report
-            dataset_name: Name of the dataset
-        """
-        # Collect images by status
+    def save_validation_report(self, output_path: str, dataset_name: str = "validation"):
         images_by_status = {
             'no_face_detected': [],
             'multiple_faces': [],
@@ -248,42 +208,25 @@ class FaceValidator:
         
         for img_path, result in self.validation_results.items():
             status = result['status']
-            if status.startswith('error'):
-                images_by_status['errors'].append({
-                    'path': img_path,
-                    'error': status
-                })
+            if 'error' in status:
+                images_by_status['errors'].append({'path': img_path, 'error': status})
             elif status == "no_face_detected":
                 images_by_status['no_face_detected'].append(img_path)
             elif status == "multiple_faces":
-                images_by_status['multiple_faces'].append({
-                    'path': img_path,
-                    'num_faces': result['num_faces']
-                })
+                images_by_status['multiple_faces'].append({'path': img_path, 'num_faces': result['num_faces']})
             else:
                 images_by_status['valid'].append(img_path)
         
-        # Create report
         report = {
             'dataset_name': dataset_name,
             'statistics': self.get_validation_stats(),
-            'detector_config': {
-                'model': 'RetinaFace (UniFace)',
-                'confidence_threshold': self.conf_threshold
-            },
+            'detector_config': {'model': 'RetinaFace (UniFace)', 'confidence_threshold': self.conf_threshold},
             'images_without_faces': images_by_status['no_face_detected'],
             'images_with_multiple_faces': images_by_status['multiple_faces'],
             'images_with_errors': images_by_status['errors'],
-            'summary': {
-                'total_images': self.stats['total_images'],
-                'images_with_valid_face': self.stats['faces_detected'],
-                'images_without_face': self.stats['no_faces'],
-                'images_with_multiple_faces': self.stats['multiple_faces'],
-                'images_with_errors': self.stats['failed_images']
-            }
+            'summary': self.stats
         }
         
-        # Save report
         output_path = Path(output_path)
         output_path.parent.mkdir(exist_ok=True, parents=True)
         
@@ -294,82 +237,54 @@ class FaceValidator:
         return report
 
 
-def validate_lfw_pairs(
-    validator: FaceValidator,
-    lfw_root: str,
-    ann_file: str,
-    policy: str = 'exclude'
-) -> Tuple[List, List, Dict]:
-    """
-    Validate LFW pairs and filter based on face detection
-    
-    Args:
-        validator: FaceValidator instance
-        lfw_root: Root directory of LFW dataset
-        ann_file: Path to annotation file
-        policy: 'exclude' or 'include' for images without faces
-        
-    Returns:
-        Tuple of (valid_pairs, excluded_pairs, statistics)
-    """
-    # Read pairs
-    with open(ann_file, 'r') as f:
-        lines = f.readlines()[1:]  # Skip header
-    
-    # Collect all unique image paths
+def validate_lfw_pairs(validator, lfw_root, ann_file, policy='exclude'):
+    try:
+        with open(ann_file, 'r') as f:
+            lines = f.readlines()[1:]
+    except FileNotFoundError:
+        print(f"Annotation file not found: {ann_file}")
+        return [], [], {}
+
     all_image_paths = set()
     
     for line in lines:
         parts = line.strip().split()
         if len(parts) == 3:
-            # Positive pair
-            person_name, img1, img2 = parts
-            path1 = os.path.join(lfw_root, person_name, f'{person_name}_{int(img1):04d}.jpg')
-            path2 = os.path.join(lfw_root, person_name, f'{person_name}_{int(img2):04d}.jpg')
-            all_image_paths.add(path1)
-            all_image_paths.add(path2)
+            person, img1, img2 = parts
+            all_image_paths.add(os.path.join(lfw_root, person, f'{person}_{int(img1):04d}.jpg'))
+            all_image_paths.add(os.path.join(lfw_root, person, f'{person}_{int(img2):04d}.jpg'))
         elif len(parts) == 4:
-            # Negative pair
-            person1, img1, person2, img2 = parts
-            path1 = os.path.join(lfw_root, person1, f'{person1}_{int(img1):04d}.jpg')
-            path2 = os.path.join(lfw_root, person2, f'{person2}_{int(img2):04d}.jpg')
-            all_image_paths.add(path1)
-            all_image_paths.add(path2)
+            p1, i1, p2, i2 = parts
+            all_image_paths.add(os.path.join(lfw_root, p1, f'{p1}_{int(i1):04d}.jpg'))
+            all_image_paths.add(os.path.join(lfw_root, p2, f'{p2}_{int(i2):04d}.jpg'))
     
-    # Validate all images
-    all_image_paths = list(all_image_paths)
-    validator.validate_dataset_images(all_image_paths, dataset_name="lfw")
+    validator.validate_dataset_images(list(all_image_paths), dataset_name="lfw")
     
-    # Filter pairs
     valid_pairs = []
     excluded_pairs = []
     
     for line in lines:
         parts = line.strip().split()
         if len(parts) == 3:
-            person_name, img1, img2 = parts
-            path1 = os.path.join(lfw_root, person_name, f'{person_name}_{int(img1):04d}.jpg')
-            path2 = os.path.join(lfw_root, person_name, f'{person_name}_{int(img2):04d}.jpg')
+            person, img1, img2 = parts
+            p1 = os.path.join(lfw_root, person, f'{person}_{int(img1):04d}.jpg')
+            p2 = os.path.join(lfw_root, person, f'{person}_{int(img2):04d}.jpg')
             is_same = '1'
         elif len(parts) == 4:
-            person1, img1, person2, img2 = parts
-            path1 = os.path.join(lfw_root, person1, f'{person1}_{int(img1):04d}.jpg')
-            path2 = os.path.join(lfw_root, person2, f'{person2}_{int(img2):04d}.jpg')
+            per1, i1, per2, i2 = parts
+            p1 = os.path.join(lfw_root, per1, f'{per1}_{int(i1):04d}.jpg')
+            p2 = os.path.join(lfw_root, per2, f'{per2}_{int(i2):04d}.jpg')
             is_same = '0'
         else:
             continue
         
-        # Check if both images have valid faces
-        result1 = validator.validation_results.get(path1, {})
-        result2 = validator.validation_results.get(path2, {})
+        res1 = validator.validation_results.get(p1, {})
+        res2 = validator.validation_results.get(p2, {})
         
-        has_face1 = result1.get('has_valid_face', True)  # Default True if not validated
-        has_face2 = result2.get('has_valid_face', True)
-        
-        if policy == 'include' or (has_face1 and has_face2):
-            valid_pairs.append((path1, path2, is_same))
+        if policy == 'include' or (res1.get('has_valid_face', True) and res2.get('has_valid_face', True)):
+            valid_pairs.append((p1, p2, is_same))
         else:
-            excluded_pairs.append((path1, path2, is_same, result1, result2))
+            excluded_pairs.append((p1, p2, is_same, res1, res2))
     
     stats = {
         'total_pairs': len(lines),
@@ -381,44 +296,18 @@ def validate_lfw_pairs(
     return valid_pairs, excluded_pairs, stats
 
 
-def print_validation_summary(validator: FaceValidator):
-    """Print formatted validation summary"""
+def print_validation_summary(validator):
     stats = validator.get_validation_stats()
-    
     print("\n" + "="*70)
-    print("FACE DETECTION VALIDATION SUMMARY (RetinaFace)")
+    print("FACE DETECTION VALIDATION SUMMARY")
     print("="*70)
-    print(f"Total images processed:        {stats['total_images']}")
-    print(f"✅ Valid faces detected:       {stats['faces_detected']} ({stats['detection_rate']:.2f}%)")
-    print(f"❌ No faces detected:          {stats['no_faces']} ({stats['no_face_rate']:.2f}%)")
-    print(f"⚠️  Multiple faces detected:   {stats['multiple_faces']} ({stats['multiple_faces_rate']:.2f}%)")
-    print(f"🔴 Processing errors:          {stats['failed_images']} ({stats['error_rate']:.2f}%)")
+    print(f"Total:      {stats['total_images']}")
+    print(f"✅ Valid:    {stats['faces_detected']} ({stats.get('detection_rate',0):.2f}%)")
+    print(f"❌ No Face:  {stats['no_faces']} ({stats.get('no_face_rate',0):.2f}%)")
+    print(f"⚠️  Multiple: {stats['multiple_faces']} ({stats.get('multiple_faces_rate',0):.2f}%)")
+    print(f"🔴 Errors:   {stats['failed_images']} ({stats.get('error_rate',0):.2f}%)")
     print("="*70 + "\n")
 
-
-# Example usage
 if __name__ == "__main__":
-    # Example: Validate LFW dataset
-    validator = FaceValidator(gpu_id=0, conf_threshold=0.5)
-    
-    lfw_root = "data/lfw/val"
-    ann_file = os.path.join(lfw_root, "lfw_ann.txt")
-    
-    # Validate and filter pairs
-    valid_pairs, excluded_pairs, stats = validate_lfw_pairs(
-        validator, lfw_root, ann_file, policy='exclude'
-    )
-    
-    # Print summary
-    print_validation_summary(validator)
-    
-    print(f"\nPair Statistics:")
-    print(f"  Total pairs: {stats['total_pairs']}")
-    print(f"  Valid pairs: {stats['valid_pairs']}")
-    print(f"  Excluded pairs: {stats['excluded_pairs']} ({stats['exclusion_rate']:.2f}%)")
-    
-    # Save validation report
-    validator.save_validation_report(
-        output_path="face_validation_cache/lfw_validation_report.json",
-        dataset_name="LFW"
-    )
+    validator = FaceValidator(conf_threshold=0.5)
+    print("Validator initialized.")
