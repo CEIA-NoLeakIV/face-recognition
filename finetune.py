@@ -258,14 +258,14 @@ def parse_arguments():
         '--val-dataset',
         type=str,
         default='lfw',
-        choices=['lfw', 'celeba'],
-        help='Validation dataset to use'
+        choices=['lfw', 'celeba', 'audit_log', 'mapping_val'],
+        help='Validation dataset to use (lfw, celeba, audit_log, or mapping_val)'
     )
     parser.add_argument(
         '--val-root',
         type=str,
         default='data/lfw/val',
-        help='Path to validation dataset root directory'
+        help='Path to validation dataset root directory (for audit_log/mapping_val, should contain the CSV file)'
     )
     parser.add_argument(
         '--val-threshold',
