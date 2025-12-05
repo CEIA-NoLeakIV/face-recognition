@@ -296,6 +296,48 @@ def validate_lfw_pairs(validator, lfw_root, ann_file, policy='exclude'):
     return valid_pairs, excluded_pairs, stats
 
 
+def validate_audit_log_pairs(validator, audit_log_pairs, policy='exclude'):
+    """
+    Validate faces in audit log pairs using RetinaFace.
+    
+    Args:
+        validator: FaceValidator instance
+        audit_log_pairs: List of tuples (path1, path2, is_same) from audit log
+        policy: 'exclude' or 'include' for pairs without valid faces
+        
+    Returns:
+        tuple: (valid_pairs, excluded_pairs, stats)
+    """
+    # Collect all unique image paths
+    all_image_paths = set()
+    for path1, path2, _ in audit_log_pairs:
+        all_image_paths.add(path1)
+        all_image_paths.add(path2)
+    
+    validator.validate_dataset_images(list(all_image_paths), dataset_name="audit_log")
+    
+    valid_pairs = []
+    excluded_pairs = []
+    
+    for path1, path2, is_same in audit_log_pairs:
+        res1 = validator.validation_results.get(path1, {})
+        res2 = validator.validation_results.get(path2, {})
+        
+        if policy == 'include' or (res1.get('has_valid_face', True) and res2.get('has_valid_face', True)):
+            valid_pairs.append((path1, path2, is_same))
+        else:
+            excluded_pairs.append((path1, path2, is_same, res1, res2))
+    
+    stats = {
+        'total_pairs': len(audit_log_pairs),
+        'valid_pairs': len(valid_pairs),
+        'excluded_pairs': len(excluded_pairs),
+        'exclusion_rate': len(excluded_pairs) / len(audit_log_pairs) * 100 if len(audit_log_pairs) > 0 else 0
+    }
+    
+    return valid_pairs, excluded_pairs, stats
+
+
 def print_validation_summary(validator):
     stats = validator.get_validation_stats()
     print("\n" + "="*70)
