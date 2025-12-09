@@ -313,6 +313,10 @@ def load_mapping_val_pairs(mapping_val_path, max_pairs_per_person=None, negative
             if not cpf or not caminho_imagem:
                 continue
             
+            # Skip images in /train directory, only process images in /val
+            if '/train/' in caminho_imagem:
+                continue
+            
             # Check if image path exists (caminho_imagem is already an absolute path)
             if os.path.exists(caminho_imagem):
                 images_by_cpf[cpf].append(caminho_imagem)
