@@ -20,6 +20,7 @@ from utils.general import (
     LOGGER,
 )
 from utils.face_validation import FaceValidator, print_validation_summary
+from utils.training_tracker import TrainingTracker
 
 from models import (
     sphere20,
@@ -170,12 +171,15 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def validate_model(model, classification_head, val_loader, device):
+def validate_model(model, classification_head, val_loader, criterion, device):
+    """Valida o modelo e retorna accuracy e loss"""
     model.eval()
     classification_head.eval()
     
     total_correct = 0
     total_samples = 0
+    total_loss = 0.0
+    num_batches = 0
     
     with torch.no_grad():
         for images, targets in val_loader:
@@ -188,16 +192,22 @@ def validate_model(model, classification_head, val_loader, device):
             else:
                 outputs, _ = classification_head(embeddings, targets)
             
+            # Calcular loss
+            loss = criterion(outputs, targets)
+            total_loss += loss.item()
+            num_batches += 1
+            
             _, predicted = torch.max(outputs.data, 1)
             total_samples += targets.size(0)
             total_correct += (predicted == targets).sum().item()
     
-    accuracy = total_correct / total_samples
+    accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     
     model.train()
     classification_head.train()
     
-    return accuracy
+    return accuracy, avg_loss
 
 
 def get_classification_head(classifier, embedding_dim, num_classes):
@@ -222,7 +232,8 @@ def train_one_epoch(
     device,
     epoch,
     params
-) -> None:
+):
+    """Treina uma época e retorna loss e accuracy médios"""
     model.train()
     losses = AverageMeter("Avg Loss", ":6.3f")
     batch_time = AverageMeter("Batch Time", ":4.3f")
@@ -250,9 +261,9 @@ def train_one_epoch(
         loss = criterion(output, target)
         accuracy = calculate_accuracy(cosine_output, target)
 
-        if args.distributed:
-            reduced_loss = reduce_tensor(loss, args.world_size)
-            accuracy = reduce_tensor(accuracy, args.world_size)
+        if params.distributed:
+            reduced_loss = reduce_tensor(loss, params.world_size)
+            accuracy = reduce_tensor(accuracy, params.world_size)
         else:
             reduced_loss = loss
 
@@ -280,12 +291,15 @@ def train_one_epoch(
             LOGGER.info(log)
 
     log = (
-        f'Epoch [{epoch}/{params.epochs}] Summary: '
+        f'Epoch [{epoch+1}/{params.epochs}] Summary: '
         f'Loss: {losses.avg:6.3f}, '
         f'Accuracy: {accuracy_meter.avg:4.2f}%, '
         f'Total Time: {batch_time.sum:4.3f}s'
     )
     LOGGER.info(log)
+    
+    # Retornar métricas da época
+    return losses.avg, accuracy_meter.avg, batch_time.sum
 
 
 def main(params):
@@ -345,8 +359,18 @@ def main(params):
         model_without_ddp = model
 
     os.makedirs(params.save_path, exist_ok=True)
-    metrics_save_path = os.path.join(params.save_path, 'metrics')
+    metrics_save_path = 'metrics'
     os.makedirs(metrics_save_path, exist_ok=True)
+
+    # Inicializar TrainingTracker
+    experiment_name = f"{params.network}_{params.classifier}_{params.database}"
+    tracker = TrainingTracker(
+        save_dir=metrics_save_path,
+        experiment_name=experiment_name
+    )
+    
+    if params.use_retinaface_validation:
+        tracker.set_face_validation_policy(params.no_face_policy)
 
     face_validator = None
     if params.use_retinaface_validation:
@@ -396,6 +420,15 @@ def main(params):
         num_workers=params.num_workers,
         pin_memory=True
     )
+    
+    # DataLoader para validação interna
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=params.batch_size,
+        shuffle=False,
+        num_workers=params.num_workers,
+        pin_memory=True
+    )
 
     LOGGER.info(f'Length of training dataset: {len(train_loader.dataset)}, Number of Identities: {num_classes}')
 
@@ -431,6 +464,9 @@ def main(params):
 
         start_epoch = ckpt['epoch']
         LOGGER.info(f'Resumed training from {params.checkpoint}, starting at epoch {start_epoch}')
+        
+        # Tentar carregar histórico do tracker
+        tracker.load_history_from_checkpoint(params.checkpoint)
 
     best_accuracy = 0.0
     curr_accuracy = 0.0
@@ -438,9 +474,11 @@ def main(params):
 
     LOGGER.info(f'Training started for {params.network}, Classifier: {params.classifier}')
     for epoch in range(start_epoch, params.epochs):
-        if args.distributed:
+        if params.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(
+        
+        # Treinar época e obter métricas
+        train_loss, train_accuracy, epoch_time = train_one_epoch(
             model,
             classification_head,
             criterion,
@@ -467,6 +505,15 @@ def main(params):
         save_on_master(checkpoint, last_save_path)
 
         if params.local_rank == 0:
+            # Validação interna
+            val_accuracy, val_loss = validate_model(
+                model_without_ddp, 
+                classification_head, 
+                val_loader, 
+                criterion, 
+                device
+            )
+            
             LOGGER.info(f'\n{"="*70}')
             LOGGER.info(f'EPOCH {epoch+1} VALIDATION METRICS')
             LOGGER.info(f'{"="*70}')
@@ -474,6 +521,7 @@ def main(params):
             epoch_metrics_path = os.path.join(metrics_save_path, f'epoch_{epoch+1}')
             os.makedirs(epoch_metrics_path, exist_ok=True)
             
+            # Avaliação externa (LFW/CelebA)
             curr_accuracy, _, metrics = evaluate.eval(
                 model_without_ddp, 
                 device=device,
@@ -484,6 +532,19 @@ def main(params):
                 threshold=params.val_threshold,
                 face_validator=face_validator,
                 no_face_policy=params.no_face_policy
+            )
+            
+            # Registrar métricas no tracker
+            current_lr = optimizer.param_groups[0]['lr']
+            tracker.log_epoch(
+                epoch=epoch + 1,
+                train_loss=train_loss,
+                train_accuracy=train_accuracy,  # já está em %
+                val_loss=val_loss,
+                val_accuracy=val_accuracy,
+                external_metrics=metrics,
+                learning_rate=current_lr,
+                epoch_time=epoch_time
             )
             
             LOGGER.info(f'\nValidation Metrics (Threshold={params.val_threshold}):')
@@ -512,16 +573,7 @@ def main(params):
             
             LOGGER.info(f'{"="*70}\n')
             
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=params.batch_size,
-                shuffle=False,
-                num_workers=params.num_workers,
-                pin_memory=True
-            )
-            
-            val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
-            LOGGER.info(f'Internal validation accuracy ({params.database} subset): {val_accuracy:.4f}\n')
+            LOGGER.info(f'Internal validation - Accuracy: {val_accuracy:.4f}, Loss: {val_loss:.4f}\n')
 
         if early_stopping(epoch, curr_accuracy):
             break
@@ -534,6 +586,7 @@ def main(params):
                 f"Model saved to {params.save_path} with `_best` postfix.\n"
             )
 
+    # Gerar relatório final com gráficos
     if params.local_rank == 0:
         LOGGER.info(f'\n{"="*70}')
         LOGGER.info('FINAL COMPREHENSIVE EVALUATION')
@@ -602,10 +655,16 @@ def main(params):
                 if 'frr' in final_metrics:
                     LOGGER.info(f'  FRR (False Reject Rate): {final_metrics["frr"]:.4f}')
         
+        # Gerar relatório final com gráficos (salva na mesma pasta de métricas)
+        tracker.generate_final_report(metrics_save_path=final_metrics_path)
+        
         LOGGER.info(f'\n{"="*70}')
         LOGGER.info(f'Metrics saved to: {final_metrics_path}')
         LOGGER.info(f'  - ROC Curve: {params.val_dataset}_roc_curve.png')
         LOGGER.info(f'  - Confusion Matrix: {params.val_dataset}_confusion_matrix.png')
+        LOGGER.info(f'  - Accuracy/Loss Curves: accuracy_loss_curves.png')
+        LOGGER.info(f'  - Training Curves: training_curves.png')
+        LOGGER.info(f'  - Logs: {tracker.logs_dir}')
         LOGGER.info(f'{"="*70}\n')
 
     LOGGER.info('Training completed.')

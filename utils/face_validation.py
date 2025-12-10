@@ -49,6 +49,8 @@ class FaceValidator:
             'multiple_faces': 0,
             'failed_images': 0
         }
+        # 🆕 Atributo adicionado para armazenar estatísticas da última validação de pares
+        self.latest_stats = None
     
     def detect_face(self, image_path: str) -> Tuple[bool, int, str]:
         """
@@ -293,6 +295,9 @@ def validate_lfw_pairs(validator, lfw_root, ann_file, policy='exclude'):
         'exclusion_rate': len(excluded_pairs) / len(lines) * 100 if len(lines) > 0 else 0
     }
     
+    # 🆕 Atualiza o validador com as estatísticas de pares para o relatório
+    validator.latest_stats = stats
+    
     return valid_pairs, excluded_pairs, stats
 
 
@@ -334,6 +339,9 @@ def validate_audit_log_pairs(validator, audit_log_pairs, policy='exclude'):
         'excluded_pairs': len(excluded_pairs),
         'exclusion_rate': len(excluded_pairs) / len(audit_log_pairs) * 100 if len(audit_log_pairs) > 0 else 0
     }
+    
+    # 🆕 Atualiza o validador com as estatísticas de pares para o relatório
+    validator.latest_stats = stats
     
     return valid_pairs, excluded_pairs, stats
 
