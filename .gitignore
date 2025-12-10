@@ -4,6 +4,7 @@ landmark_cache/
 data/
 weights/
 assets/
+assets/*
 
 # --- Segurança e Ambientes (CRÍTICO) ---
 .env
