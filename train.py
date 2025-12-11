@@ -47,8 +47,8 @@ def parse_arguments():
         '--database',
         type=str,
         default='WebFace',
-        choices=['WebFace', 'VggFace2', "MS1M", 'VggFaceHQ'],
-        help='Database to use for training. Options: WebFace, VggFace2, MS1M, VggFaceHQ.'
+        choices=['WebFace', 'VggFace2', "MS1M", 'VggFaceHQ', 'VggFaceHQSimilaridade'],
+        help='Database to use for training. Options: WebFace, VggFace2, MS1M, VggFaceHQ, VggFaceHQSimilaridade.'
     )
 
     parser.add_argument(
@@ -318,7 +318,8 @@ def main(params):
         'WebFace': {'num_classes': 10572},
         'VggFace2': {'num_classes': 8631},
         'MS1M': {'num_classes': 85742},
-        'VggFaceHQ': {'num_classes': 9131}
+        'VggFaceHQ': {'num_classes': 9131},
+        'VggFaceHQSimilaridade': {'num_classes': 14128}
     }
     
     if params.database not in db_config:
