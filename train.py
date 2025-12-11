@@ -119,8 +119,8 @@ def parse_arguments():
         '--val-dataset',
         type=str,
         default='lfw',
-        choices=['lfw', 'celeba'],
-        help='Validation dataset to use. Options: lfw, celeba. Default: lfw.'
+        choices=['lfw', 'celeba', 'custom'],
+        help='Validation dataset to use. Options: lfw, celeba, custom. Default: lfw.'
     )
     parser.add_argument(
         '--val-root',
