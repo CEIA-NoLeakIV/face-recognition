@@ -376,6 +376,49 @@ def load_mapping_val_pairs(mapping_val_path, max_pairs_per_person=None, negative
     return pairs
 
 
+def load_custom_pairs(ann_file, root):
+    """
+    Load pairs from lfw_ann.txt with real filenames (custom dataset format).
+    
+    Format:
+        Positive: class<TAB>filename1<TAB>filename2
+        Negative: class1<TAB>filename1<TAB>class2<TAB>filename2
+    
+    Args:
+        ann_file: Path to lfw_ann.txt
+        root: Root directory of dataset
+        
+    Returns:
+        list: List of tuples (path1, path2, is_same)
+    """
+    pairs = []
+    
+    with open(ann_file, 'r') as f:
+        lines = f.readlines()[1:]  # Skip header
+    
+    for line in lines:
+        parts = line.strip().split('\t')
+        
+        if len(parts) == 3:
+            # Par positivo
+            class_name, file1, file2 = parts
+            path1 = os.path.join(root, class_name, file1)
+            path2 = os.path.join(root, class_name, file2)
+            is_same = '1'
+        elif len(parts) == 4:
+            # Par negativo
+            class1, file1, class2, file2 = parts
+            path1 = os.path.join(root, class1, file1)
+            path2 = os.path.join(root, class2, file2)
+            is_same = '0'
+        else:
+            continue
+        
+        pairs.append((path1, path2, is_same))
+    
+    return pairs
+
+
 def eval(
     model, 
     model_path=None, 
@@ -389,14 +432,14 @@ def eval(
     no_face_policy='exclude'
 ):
     """
-    Evaluate the model on validation dataset (LFW, CelebA, audit_log, or mapping_val).
+    Evaluate the model on validation dataset (LFW, CelebA, audit_log, mapping_val, or custom).
     
     Args:
         model: The model to evaluate
         model_path: Path to model weights (optional)
         device: Device to run evaluation on
-        val_dataset: Dataset to use for validation ('lfw', 'celeba', 'audit_log', or 'mapping_val')
-        val_root: Root directory of validation data (for audit_log/mapping_val, should contain the CSV file)
+        val_dataset: Dataset to use for validation ('lfw', 'celeba', 'audit_log', 'mapping_val', or 'custom')
+        val_root: Root directory of validation data
         compute_full_metrics: If True, compute complete metrics (ROC, confusion matrix, etc)
         save_metrics_path: Directory to save metric plots
         threshold: Similarity threshold for classification metrics
@@ -438,8 +481,7 @@ def eval(
         ann_file = os.path.join(root, 'audit_log.csv')
         try:
             pairs = load_audit_log_pairs(ann_file, root)
-            # Convert pairs to a format compatible with existing processing
-            pair_lines = pairs  # This will be handled differently in processing loop
+            pair_lines = pairs
         except FileNotFoundError:
             print(f"ERROR: Audit log file 'audit_log.csv' not found in '{root}'. Check the path.")
             return 0.0, np.array([]), {}
@@ -450,16 +492,27 @@ def eval(
         ann_file = os.path.join(root, 'mapping_val.csv')
         try:
             pairs = load_mapping_val_pairs(ann_file)
-            # Convert pairs to a format compatible with existing processing
-            pair_lines = pairs  # This will be handled differently in processing loop
+            pair_lines = pairs
         except FileNotFoundError:
             print(f"ERROR: Mapping val file 'mapping_val.csv' not found in '{root}'. Check the path.")
             return 0.0, np.array([]), {}
         except Exception as e:
             print(f"ERROR: Failed to load mapping_val: {e}")
             return 0.0, np.array([]), {}
+    elif val_dataset == 'custom':
+        # Dataset customizado com custom.txt usando nomes reais de arquivos
+        ann_file = os.path.join(root, 'custom.txt')
+        try:
+            pairs = load_custom_pairs(ann_file, root)
+            pair_lines = pairs
+        except FileNotFoundError:
+            print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'. Check the path.")
+            return 0.0, np.array([]), {}
+        except Exception as e:
+            print(f"ERROR: Failed to load custom pairs: {e}")
+            return 0.0, np.array([]), {}
     else:
-        raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw', 'celeba', 'audit_log', or 'mapping_val'.")
+        raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw', 'celeba', 'audit_log', 'mapping_val', or 'custom'.")
 
     # Face validation with RetinaFace (if enabled)
     use_validated_pairs = False
@@ -472,8 +525,8 @@ def eval(
         
         from utils.face_validation import validate_lfw_pairs, validate_audit_log_pairs, print_validation_summary
         
-        if val_dataset in ['audit_log', 'mapping_val']:
-            # For audit_log and mapping_val, pairs are already in (path1, path2, is_same) format
+        if val_dataset in ['audit_log', 'mapping_val', 'custom']:
+            # Para esses datasets, pairs ja estao no formato (path1, path2, is_same)
             validated_pairs_list, excluded_pairs, face_stats = validate_audit_log_pairs(
                 validator=face_validator,
                 audit_log_pairs=pair_lines,
@@ -523,7 +576,7 @@ def eval(
         print(f"  Policy:          {no_face_policy}")
         print(f"{'='*70}\n")
         
-        if val_dataset in ['audit_log', 'mapping_val']:
+        if val_dataset in ['audit_log', 'mapping_val', 'custom']:
             print(f"Evaluating on {len(validated_pairs_list)} validated pairs...")
         else:
             print(f"Evaluating on {len(pair_lines)} validated pairs...")
@@ -531,8 +584,8 @@ def eval(
     # Process pairs
     predicts = []
     with torch.no_grad():
-        if val_dataset in ['audit_log', 'mapping_val']:
-            # For audit_log and mapping_val, pairs are already in (path1, path2, is_same) format
+        if val_dataset in ['audit_log', 'mapping_val', 'custom']:
+            # Para esses datasets, pairs ja estao no formato (path1, path2, is_same)
             pairs_to_process = validated_pairs_list if (use_validated_pairs and len(validated_pairs_list) > 0) else pair_lines
             for path1, path2, is_same in pairs_to_process:
                 try:
