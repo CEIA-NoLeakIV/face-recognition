@@ -378,14 +378,14 @@ def load_mapping_val_pairs(mapping_val_path, max_pairs_per_person=None, negative
 
 def load_custom_pairs(ann_file, root):
     """
-    Load pairs from lfw_ann.txt with real filenames (custom dataset format).
+    Load pairs from custom.txt with real filenames (custom dataset format).
     
     Format:
         Positive: class<TAB>filename1<TAB>filename2
         Negative: class1<TAB>filename1<TAB>class2<TAB>filename2
     
     Args:
-        ann_file: Path to lfw_ann.txt
+        ann_file: Path to custom.txt
         root: Root directory of dataset
         
     Returns:
@@ -415,6 +415,38 @@ def load_custom_pairs(ann_file, root):
             continue
         
         pairs.append((path1, path2, is_same))
+    
+    return pairs
+
+
+def load_celeba_pairs(ann_file, root):
+    """
+    Load pairs from celeba_pairs.txt.
+    
+    Format:
+        file1.jpg<TAB>file2.jpg<TAB>label (1 ou 0)
+    
+    Args:
+        ann_file: Path to celeba_pairs.txt
+        root: Root directory of CelebA images
+        
+    Returns:
+        list: List of tuples (path1, path2, is_same)
+    """
+    pairs = []
+    
+    with open(ann_file, 'r') as f:
+        lines = f.readlines()[1:]  # Skip header (numero de pares)
+    
+    for line in lines:
+        parts = line.strip().split('\t')
+        
+        if len(parts) == 3:
+            file1, file2, label = parts
+            path1 = os.path.join(root, file1)
+            path2 = os.path.join(root, file2)
+            is_same = label
+            pairs.append((path1, path2, is_same))
     
     return pairs
 
@@ -472,10 +504,13 @@ def eval(
     elif val_dataset == 'celeba':
         ann_file = os.path.join(root, 'celeba_pairs.txt')
         try:
-            with open(ann_file) as f:
-                pair_lines = f.readlines()[1:]  # Skip header
+            pairs = load_celeba_pairs(ann_file, root)
+            pair_lines = pairs
         except FileNotFoundError:
             print(f"ERROR: Annotation file 'celeba_pairs.txt' not found in '{root}'. Check the path.")
+            return 0.0, np.array([]), {}
+        except Exception as e:
+            print(f"ERROR: Failed to load CelebA pairs: {e}")
             return 0.0, np.array([]), {}
     elif val_dataset == 'audit_log':
         ann_file = os.path.join(root, 'audit_log.csv')
@@ -506,7 +541,7 @@ def eval(
             pairs = load_custom_pairs(ann_file, root)
             pair_lines = pairs
         except FileNotFoundError:
-            print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'. Check the path.")
+            print(f"ERROR: Annotation file 'custom.txt' not found in '{root}'. Check the path.")
             return 0.0, np.array([]), {}
         except Exception as e:
             print(f"ERROR: Failed to load custom pairs: {e}")
@@ -525,7 +560,7 @@ def eval(
         
         from utils.face_validation import validate_lfw_pairs, validate_audit_log_pairs, print_validation_summary
         
-        if val_dataset in ['audit_log', 'mapping_val', 'custom']:
+        if val_dataset in ['audit_log', 'mapping_val', 'custom', 'celeba']:
             # Para esses datasets, pairs ja estao no formato (path1, path2, is_same)
             validated_pairs_list, excluded_pairs, face_stats = validate_audit_log_pairs(
                 validator=face_validator,
@@ -534,7 +569,7 @@ def eval(
             )
             use_validated_pairs = True
         else:
-            # For lfw and celeba, use existing validation
+            # For lfw, use existing validation
             valid_pairs, excluded_pairs, face_stats = validate_lfw_pairs(
                 validator=face_validator,
                 lfw_root=root,
@@ -542,27 +577,25 @@ def eval(
                 policy=no_face_policy
             )
             
-            # Convert back to pair_lines format for lfw/celeba
+            # Convert back to pair_lines format for lfw
             pair_lines_filtered = []
             for path1, path2, is_same in valid_pairs:
-                if val_dataset == 'lfw':
-                    # Extract person name and image number from path
-                    parts1 = path1.replace('\\', '/').split('/')
-                    parts2 = path2.replace('\\', '/').split('/')
-                    
-                    person1 = parts1[-2]
-                    person2 = parts2[-2]
-                    
-                    filename1 = parts1[-1]
-                    filename2 = parts2[-1]
-                    
-                    img_num1 = filename1.split('_')[-1].split('.')[0]
-                    img_num2 = filename2.split('_')[-1].split('.')[0]
-                    
-                    if person1 == person2:
-                        pair_lines_filtered.append(f"{person1} {img_num1} {img_num2}\n")
-                    else:
-                        pair_lines_filtered.append(f"{person1} {img_num1} {person2} {img_num2}\n")
+                parts1 = path1.replace('\\', '/').split('/')
+                parts2 = path2.replace('\\', '/').split('/')
+                
+                person1 = parts1[-2]
+                person2 = parts2[-2]
+                
+                filename1 = parts1[-1]
+                filename2 = parts2[-1]
+                
+                img_num1 = filename1.split('_')[-1].split('.')[0]
+                img_num2 = filename2.split('_')[-1].split('.')[0]
+                
+                if person1 == person2:
+                    pair_lines_filtered.append(f"{person1} {img_num1} {img_num2}\n")
+                else:
+                    pair_lines_filtered.append(f"{person1} {img_num1} {person2} {img_num2}\n")
             
             pair_lines = pair_lines_filtered
         
@@ -576,7 +609,7 @@ def eval(
         print(f"  Policy:          {no_face_policy}")
         print(f"{'='*70}\n")
         
-        if val_dataset in ['audit_log', 'mapping_val', 'custom']:
+        if val_dataset in ['audit_log', 'mapping_val', 'custom', 'celeba']:
             print(f"Evaluating on {len(validated_pairs_list)} validated pairs...")
         else:
             print(f"Evaluating on {len(pair_lines)} validated pairs...")
@@ -584,7 +617,7 @@ def eval(
     # Process pairs
     predicts = []
     with torch.no_grad():
-        if val_dataset in ['audit_log', 'mapping_val', 'custom']:
+        if val_dataset in ['audit_log', 'mapping_val', 'custom', 'celeba']:
             # Para esses datasets, pairs ja estao no formato (path1, path2, is_same)
             pairs_to_process = validated_pairs_list if (use_validated_pairs and len(validated_pairs_list) > 0) else pair_lines
             for path1, path2, is_same in pairs_to_process:
@@ -604,7 +637,7 @@ def eval(
                 distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
                 predicts.append([path1, path2, distance.item(), is_same])
         else:
-            # For lfw and celeba, process line-by-line
+            # For lfw, process line-by-line
             for line in pair_lines:
                 parts = line.strip().split()
 
@@ -629,16 +662,6 @@ def eval(
                         path1 = os.path.join(root, person1, filename1)
                         path2 = os.path.join(root, person2, filename2)
                         is_same = '0'
-                    else:
-                        continue
-                        
-                elif val_dataset == 'celeba':
-                    if len(parts) == 2:
-                        filename1, filename2 = parts[0], parts[1]
-                        
-                        path1 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', filename1)
-                        path2 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', filename2)
-                        is_same = '1'
                     else:
                         continue
 
