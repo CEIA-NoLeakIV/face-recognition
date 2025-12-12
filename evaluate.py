@@ -10,9 +10,6 @@ from sklearn.metrics import roc_curve, auc, confusion_matrix
 from tqdm import tqdm
 from collections import defaultdict
 
-# Imports específicos de Landmarks
-from utils.landmark_annotator import LandmarkAnnotator, extract_landmarks_single_image
-
 # --- FUNÇÕES DE CARREGAMENTO DE DATASETS ---
 
 def load_audit_log_pairs(audit_log_path, val_root):
@@ -145,32 +142,28 @@ def load_celeba_pairs(ann_file, root, max_pairs=6000):
     """
     pairs = []
     
-    # Verifica se o arquivo existe
     if not os.path.exists(ann_file):
         raise FileNotFoundError(f"CelebA pairs file not found: {ann_file}")
 
     with open(ann_file, 'r') as f:
-        lines = f.readlines()[1:] # Pula o cabeçalho (count)
+        lines = f.readlines()[1:] # Pula cabeçalho
     
-    # CORREÇÃO: Amostragem se o arquivo for muito grande (evita loop infinito)
+    # Amostragem se arquivo for muito grande
     if len(lines) > max_pairs:
         print(f"⚠️  CelebA file has {len(lines)} pairs. Randomly sampling {max_pairs} for faster evaluation.")
         random.seed(42)
         lines = random.sample(lines, max_pairs)
     
     for line in lines:
-        # CORREÇÃO: split() sem argumentos lida com \t e espaços múltiplos
         parts = line.strip().split()
         
         if len(parts) == 3:
             file1, file2, label = parts
             
-            # Tenta encontrar o caminho correto (algumas versões do CelebA tem pastas aninhadas)
-            # Tenta estrutura padrão: root/img_align_celeba/img_align_celeba/imagem.jpg
+            # Tenta encontrar o caminho correto
             path1 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', file1)
             path2 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', file2)
             
-            # Fallback se não existir: root/imagem.jpg
             if not os.path.exists(path1):
                  path1 = os.path.join(root, file1)
                  path2 = os.path.join(root, file2)
@@ -181,16 +174,9 @@ def load_celeba_pairs(ann_file, root, max_pairs=6000):
     return pairs
 
 
-# --- FUNÇÕES CORE (Extração de Features com Landmarks) ---
+# --- FUNÇÕES CORE ---
 
-def extract_deep_features(
-    model,
-    img,
-    device,
-    use_landmarks=False,
-    landmarks=None,
-    landmark_detector=None
-):
+def extract_deep_features(model, img, device):
     """
     Extract deep features from an image.
     """
@@ -203,18 +189,7 @@ def extract_deep_features(
     img_tensor = transform(img).unsqueeze(0).to(device)
     
     with torch.no_grad():
-        if use_landmarks:
-            if landmarks is None:
-                img_np = np.array(img)
-                landmarks = extract_landmarks_single_image(img_np, landmark_detector)
-                
-                if landmarks is None:
-                    landmarks = np.zeros((5, 2), dtype=np.float32)
-            
-            landmarks_tensor = torch.from_numpy(landmarks).unsqueeze(0).to(device)
-            features = model(img_tensor, landmarks_tensor)
-        else:
-            features = model(img_tensor)
+        features = model(img_tensor)
     
     return features.squeeze(0).cpu()
 
@@ -392,11 +367,12 @@ def eval(
     threshold=0.35,
     face_validator=None,
     no_face_policy='exclude',
-    use_landmarks=False,
+    # Parâmetros antigos de landmarks mantidos para compatibilidade mas não usados
+    use_landmarks=False, 
     landmark_cache_dir='landmark_cache'
 ):
     """
-    Evaluate the model on validation dataset (LFW, CelebA, AuditLog, MappingVal, Custom).
+    Evaluate the model on validation dataset.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -408,29 +384,9 @@ def eval(
 
     root = val_root
     
-    # Inicializa detector de landmarks se necessário
-    landmark_detector = None
-    landmarks_cache = {}
-    
-    if use_landmarks:
-        try:
-            from uniface import RetinaFace
-            landmark_detector = RetinaFace()
-            
-            # Tenta carregar cache de landmarks
-            annotator = LandmarkAnnotator(cache_dir=landmark_cache_dir)
-            cache_path = annotator._get_cache_path(val_dataset)
-            if cache_path.exists():
-                import json
-                with open(cache_path, 'r') as f:
-                    cached_data = json.load(f)
-                landmarks_cache = cached_data.get('landmarks', {})
-        except ImportError:
-            pass
-    
     # Select annotation file and load pairs based on dataset
     pair_lines = []
-    pairs_preloaded = False # Flag para indicar se pairs já são tuplas (path1, path2, is_same)
+    pairs_preloaded = False
 
     if val_dataset == 'lfw':
         ann_file = os.path.join(root, 'lfw_ann.txt')
@@ -445,7 +401,7 @@ def eval(
     elif val_dataset == 'celeba':
         ann_file = os.path.join(root, 'celeba_pairs.txt')
         try:
-            # CORREÇÃO: Limita a 6000 pares para não travar a validação
+            # Proteção contra dataset gigante
             pair_lines = load_celeba_pairs(ann_file, root, max_pairs=6000)
             pairs_preloaded = True
         except FileNotFoundError:
@@ -503,7 +459,6 @@ def eval(
         print(f"{'='*70}")
         
         if val_dataset in ['audit_log', 'mapping_val', 'custom', 'celeba']:
-            # Usa validate_audit_log_pairs para datasets que já carregaram tuplas
             validated_pairs_list, excluded_pairs, face_stats = validate_audit_log_pairs(
                 validator=face_validator,
                 audit_log_pairs=pair_lines,
@@ -511,7 +466,7 @@ def eval(
             )
             use_validated_pairs = True
             
-        else: # LFW case (ainda são linhas de texto)
+        else: # LFW case
             valid_pairs, excluded_pairs, face_stats = validate_lfw_pairs(
                 validator=face_validator,
                 lfw_root=root,
@@ -519,7 +474,6 @@ def eval(
                 policy=no_face_policy
             )
             
-            # Reconstrói pair_lines apenas com os válidos no formato original de texto
             pair_lines_filtered = []
             for path1, path2, is_same in valid_pairs:
                 if val_dataset == 'lfw':
@@ -544,17 +498,14 @@ def eval(
             
         print_validation_summary(face_validator)
 
-    # Definir lista final de pares para processamento
+    # Definir lista final
     if use_validated_pairs:
-        # Se usou validação nos novos datasets, use a lista validada
         final_pairs_iterator = validated_pairs_list
         is_iterator_tuples = True
     elif pairs_preloaded:
-        # Se é novo dataset mas sem validação, use a lista carregada
         final_pairs_iterator = pair_lines
         is_iterator_tuples = True
     else:
-        # LFW legado (lista de strings)
         final_pairs_iterator = pair_lines
         is_iterator_tuples = False
 
@@ -565,11 +516,9 @@ def eval(
     with torch.no_grad():
         for item in tqdm(final_pairs_iterator, desc="Evaluating pairs", unit="pair"):
             
-            # Lógica de Parsing
             if is_iterator_tuples:
                 path1, path2, is_same = item
             else:
-                # LFW parsing legado
                 line = item
                 parts = line.strip().split()
                 if val_dataset == 'lfw':
@@ -592,7 +541,6 @@ def eval(
                 else:
                     continue
 
-            # Carregamento
             try:
                 img1 = Image.open(path1).convert('RGB')
                 img2 = Image.open(path2).convert('RGB')
@@ -600,32 +548,8 @@ def eval(
                 skipped += 1
                 continue
 
-            # Landmarks e Features
-            landmarks1 = None
-            landmarks2 = None
-            
-            if use_landmarks:
-                rel_path1 = os.path.relpath(path1, root) if root in path1 else path1
-                rel_path2 = os.path.relpath(path2, root) if root in path2 else path2
-                
-                if rel_path1 in landmarks_cache:
-                    landmarks1 = np.array(landmarks_cache[rel_path1], dtype=np.float32)
-                
-                if rel_path2 in landmarks_cache:
-                    landmarks2 = np.array(landmarks_cache[rel_path2], dtype=np.float32)
-
-            f1 = extract_deep_features(
-                model, img1, device,
-                use_landmarks=use_landmarks,
-                landmarks=landmarks1,
-                landmark_detector=landmark_detector
-            )
-            f2 = extract_deep_features(
-                model, img2, device,
-                use_landmarks=use_landmarks,
-                landmarks=landmarks2,
-                landmark_detector=landmark_detector
-            )
+            f1 = extract_deep_features(model, img1, device)
+            f2 = extract_deep_features(model, img2, device)
 
             distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
             predicts.append([path1, path2, distance.item(), is_same])
